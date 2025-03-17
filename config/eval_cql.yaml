@@ -1,0 +1,24 @@
+defaults:
+  - agent: cql
+  - test_suites: nocrash_dense
+actors:
+  hero:
+    agent: cql
+    reward:
+      entry_point: reward.valeo_action:ValeoAction
+    terminal:
+      entry_point: terminal.valeo_no_det_px:ValeoNoDetPx
+carla_sh_path: /home/mkdusgml/carla_ws/carla0910/CarlaUE4.sh
+log_level: INFO
+host: localhost
+port: 2000
+seed: 42
+no_rendering: false
+kill_running: true
+resume: true
+wb: true
+wb_project: hsovp
+wb_name: eval_hsovp
+wb_notes: null
+wb_tags: ['hsovp', 'baseline', 'evaluation', 'nocrash_dense', ]
+log_video: true

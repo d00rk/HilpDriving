@@ -1,0 +1,24 @@
+defaults:
+  - agent: opal
+  - test_suites: nocrash_dense
+actors:
+  hero:
+    agent: opal
+    reward:
+      entry_point: reward.valeo_action:ValeoAction
+    terminal:
+      entry_point: terminal.valeo_no_det_px:ValeoNoDetPx
+carla_sh_path: /home/mkdusgml/carla_ws/carla0910/CarlaUE4.sh
+log_level: INFO
+host: localhost
+port: 2000
+seed: 42
+no_rendering: false
+kill_running: true
+resume: true
+wb: true
+wb_project: opal
+wb_name: eval_opal
+wb_notes: null
+wb_tags: ['opal', 'baseline', 'evaluation', 'nocrash_dense', ]
+log_video: true

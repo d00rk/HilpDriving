@@ -1,0 +1,33 @@
+data:
+    data_algo: "roach_bc"
+    data_benchmark: "leaderboard1"
+    data_town: ["Town04"]
+    num_workers: 4
+    train_batch_size: 256
+    val_batch_size: 256
+    val_ratio: 0.2
+    length: 10
+
+model:
+    obs_dim: 192
+    action_dim: 3
+    latent_dim: 8
+    obs_feature_dim: 64
+    hidden_dim: 128
+    gru_layers: 2
+
+train:
+    device: "cuda:0"
+    seed: 42
+    num_epochs: 1000
+    eval_frequency: 10
+    lr: 0.001
+    kl_weight: 1.0
+
+resume: false
+resume_ckpt_dir: "2025-03-17 11:23:51"
+verbose: true
+wb: true
+wandb_project: "opal"
+wandb_name: "opal"
+wandb_tag: ["opal", "baseline", "roach_bc", "leaderboard1", "Town04"]

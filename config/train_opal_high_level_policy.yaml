@@ -1,0 +1,36 @@
+data_algo: "roach_bc"
+data_benchmark: "leaderboard1"
+data_town: ["Town04"]
+encoder_dir: "2025-03-16 21:49:53"
+encoder_dict_name: "opal_2025-03-17 06:54:11_epoch_90"
+seed: 42
+
+model:
+    state_dim: 12
+    action_dim: 3
+    latent_dim: 8
+
+dataset:
+    num_workers: 4
+    train_batch_size: 128
+    val_batch_size: 16
+    val_ratio: 0.2
+    trajectory_length: 10
+
+train:
+    algo: "iql"
+    device: "cuda:0"
+    resume: false
+    resume_ckpt_dir: ""
+    num_epochs: 1000
+    num_evals: 10
+    eval_frequency: 10
+    lr: 0.001
+    tau: 0.7
+    beta: 3.0
+
+verbose: true
+wb: true
+wandb_project: "opal"
+wandb_name: "train_high_level_policy"
+wandb_tag: "roach_bc_nocrash"

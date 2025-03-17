@@ -1,0 +1,31 @@
+model:
+  latent_dim: 8
+  state_dim: 128
+  act_dim: 3
+task:
+  actors:
+    ego_vehicle:
+      model: vehicle.tesla.model3
+    endless:
+      ego_vehicle: false
+reward:
+  ego_vehicle:
+    entry_point: reward.valeo_reward:ValeoReward
+terminal:
+  ego_vehicle:
+    entry_point: terminal.valeo_terminal:ValeoTerminal
+policy:
+  ckpt_dir: outputs
+  high_ckpt: high_level_polilcy/1
+  low_ckpt: hilbert_policy/1
+verbose: true
+debug_mode: true
+sync_mode: true
+seed: 42
+host: localhost
+port: 2000
+client_timeout: 30.0
+max_steps_per_route: 1000
+log_video: true
+video_view: front_rgb
+wb: false
