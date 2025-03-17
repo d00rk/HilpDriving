@@ -2,8 +2,4 @@ __pycache__
 assets
 data
 outputs
-etc
 wandb
-
-analysis.ipynb
-tmp.ipynb
