@@ -1,0 +1,34 @@
+data:
+    data_algo: "roach_bc"
+    data_benchmark: "leaderboard1"
+    data_town: ["Town04"]
+    p: 0.2
+    num_workers: 4
+    train_batch_size: 256
+    val_batch_size: 256
+    val_ratio: 0.2
+    length: 10
+
+model:
+    obs_dim: 192
+    action_dim: 3
+    latent_dim: 8
+    latent_as_action: false
+
+train:
+    device: "cuda:0"
+    seed: 42
+    num_epochs: 1000
+    eval_frequency: 10
+    lr: 0.001
+    tau: 0.005
+    expectile_tau: 0.7
+    epsilon: 1e-6
+
+resume: true
+resume_ckpt_dir: "2025-03-17 11:23:51"
+verbose: true
+wb: true
+wandb_project: "hilbert"
+wandb_name: "hilbert-representation"
+wandb_tag: ["mine", "hilbert-representation", "roach_bc", "leaderboard1", "Town04"]
