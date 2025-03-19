@@ -9,6 +9,7 @@ import copy
 import torch
 from torch.utils.data import Dataset
 from torch.distributions import Normal
+from sklearn.cluster import KMeans
 import numpy as np
 
 from utils.sampler import get_val_mask
@@ -155,12 +156,13 @@ class GoalDataset(Dataset):
 # HILPDataset: {(s, z, s', R, terminal)_0^T}
 # =============================================================================
 class HILPDataset(Dataset):
-    def __init__(self, seed, gamma, hilp, cfg):
+    def __init__(self, seed, gamma, encoder, cfg):
         self.seed = seed
         seed_all(self.seed)
         self.val_ratio = cfg.val_ratio
         self.gamma = gamma
-        self.hilp = hilp
+        self.encoder = encoder
+        self.algo = cfg.algo
         
         self.index_list = list()
         hdf5_paths = []
@@ -191,17 +193,44 @@ class HILPDataset(Dataset):
         return len(self.index_list)
     
     def __getitem__(self, index):
-        file_path, current_key, next_key, terminal, start_idx, end_idx, step_keys = self.index_list[index]
+        file_path, current_key, end_key, terminal, start_idx, end_idx, step_keys = self.index_list[index]
         with h5py.File(file_path, 'r') as f:
             current_obs = f[current_key]['obs']['birdview']['birdview'][:]
-            next_obs = f[next_key]['obs']['birdview']['birdview'][:]
+            next_obs = f[end_key]['obs']['birdview']['birdview'][:]
             
-            with torch.no_grad():
-                z = self.hilp(current_obs)
-                z_next = self.hilp(next_obs)
-                vec = z_next - z
-                norm = np.linalg.norm(vec)
-                z = vec / (norm + 1e-6)
+            if self.algo == "hilp":
+                with torch.no_grad():
+                    z = self.encoder(current_obs)
+                    z_next = self.encoder(next_obs)
+                    vec = z_next - z
+                    norm = np.linalg.norm(vec)
+                    z = vec / (norm + 1e-6)
+            else:
+                with torch.no_grad():
+                    traj = []
+                    for j in range(start_idx, end_idx):
+                        s = f[step_keys[j]]['obs']['birdview']['birdview'][:]
+                        a = f[step_keys[j]]['supervision']['action'][:]
+                        s_next = f[step_keys[min(j+1, end_idx)]]['obs']['birdview']['birdview'][:]
+                        r = f[step_keys[j]]['reward'][()]
+                        terminal = f[step_keys[j]]['terminal'][()]
+                        traj.append([s, a, s_next, r, terminal, False])
+                    s, a, s_n, r, terminal, timeout = zip(*traj)
+                    s = torch.tensor(np.array(s).transpose(0, 3, 1, 2), 
+                            dtype=torch.float32).contiguous().clone()
+                    a = torch.tensor(np.array(a), 
+                             dtype=torch.float32).contiguous().clone()
+                    s_n = torch.tensor(np.array(s_n).transpose(0, 3, 1, 2), 
+                                 dtype=torch.float32).contiguous().clone()
+                    r = torch.tensor(np.array(r), 
+                             dtype=torch.float32).unsqueeze(1).contiguous().clone()
+                    terminal = torch.tensor(np.array(terminal), 
+                               dtype=torch.float32).unsqueeze(1).contiguous().clone()
+                    timeout = torch.tensor(np.array(timeout), 
+                              dtype=torch.float32).unsqueeze(1).contiguous().clone()
+                    subtraj = (s, a, s_n, r, terminal, timeout)
+
+                    z = self.encoder(subtraj)
                 
             R = 0.0
             for j in range(start_idx, end_idx):
@@ -233,7 +262,7 @@ class SubTrajDataset(Dataset):
         self.seed = seed
         seed_all(self.seed)
         self.val_ratio = cfg.val_ratio
-        hdf5_paths = ()
+        hdf5_paths = list()
         for t in cfg.data_town:
             hp = glob.glob(os.path.join(os.path.dirname(os.getcwd()),
                                           f'datasets/{cfg.data_algo}/{cfg.data_benchmark}/{t.lower()}_*.hdf5'))
@@ -383,19 +412,105 @@ class LowLevelDataset(SubTrajDataset):
             
         return (obs, actions, z)
 
+
+
+###############################################################################
+# FilteredDataset (HsO-VP): labeling sub-trajectories using K-means clustering
+###############################################################################
+
 class FilteredDataset(Dataset):
-    def __init__(self, data):
-        self.data = data
-    
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        return self.data[idx]
-    
-    def split_train_val(self, val_ratio=0.2, seed=0):
-        val_mask = get_val_mask(len(self), val_ratio, seed)
-        train_data = [self.data[i] for i, m in enumerate(val_mask) if not m]
-        val_data = [self.data[i] for i, m in enumerate(val_mask) if m]
+    def __init__(self, seed, cfg):
+        self.seed = seed
+        seed_all(self.seed)
+        self.cfg = cfg
         
-        return FilteredDataset(train_data), FilteredDataset(val_data)
+        hdf5_paths = list()
+        for t in self.cfg.data_town:
+            hp = glob.glob(os.path.join(os.path.dirname(os.getcwd()),
+                                        f'datasets/{self.cfg.data_algo}/{self.cfg.data_benchmark}/{t.lower()}_*.hdf5'))
+            hdf5_paths.extend(hp)
+        hdf5_paths = sorted(hdf5_paths)
+        
+        self.index_list = list()
+        action_feature_list = list()
+        
+        for hdf5_path in hdf5_paths:
+            with h5py.File(hdf5_path, 'r') as f:
+                step_keys = sorted([k for k in f.keys() if k.startswith("step_")],
+                                   key=lambda x: int(x.split("_")[1]))
+                epi_length = len(step_keys)
+                last_sequence_start = epi_length - cfg.length
+                for i in range(last_sequence_start + 1):
+                    next_idx = i + cfg.length - 1
+                    terminal = (next_idx == epi_length - 1)
+                    self.index_list.append((hdf5_path, step_keys, i, next_idx, terminal))
+                    
+                    actions = ()
+                    for j in range(i, next_idx + 1):
+                        action = f[step_keys[j]]['supervision']['action'][:]
+                        actions.append(actions.flatten())
+                    concat_action = np.concatenate(actions, axis=0)
+                    action_feature_list.append(concat_action)
+        self.action_features = np.array(action_feature_list)
+        
+        self.num_cluster = cfg.discrete_option if hasattr(cfg, "discrete_option") else 10
+        kmeans = KMeans(n_clusters=self.num_cluster, random_state=self.seed)
+        self.cluster_labels = kmeans.fit_predict(self.action_features)
+        self.cluster_centers = kmeans.cluster_centers_
+        
+        clusters = dict()
+        for cluster_id in range(self.num_cluster):
+            clusters[cluster_id] = np.where(self.cluster_labels == cluster_id)[0]
+            
+        min_cluster_size = min(len(indices) for indices in clusters.values())
+        selected_indices = []
+        for cluster_id, indices in clusters.items():
+            center = self.cluster_centers[cluster_id]
+            actions_in_cluster = self.action_features[indices]
+            distances = np.linalg.norm(actions_in_cluster - center, axis=1)
+            sorted_order = np.argsort(distances)
+            selected = indices[sorted_order[:min_cluster_size]]
+            selected_indices.extend(selected.tolist())
+        
+        self.filtered_index_list = [self.index_list[i] for i in selected_indices]
+        self.filtered_cluster_labels = self.cluster_labels[selected_indices]
+        
+    def __len__(self):
+        return len(self.filtered_index_list)
+    
+    def __getitem__(self, index):
+        file_path, step_keys, start_idx, end_idx, terminal = self.filtered_index_list[index]
+        cluster_label = int(self.filtered_cluster_labels[index])
+        trajectories = list()
+        with h5py.File(file_path, 'r') as f:
+            for j in range(start_idx, end_idx + 1):
+                obs = f[step_keys[j]]['obs']['birdview']['birdview'][:]
+                action = f[step_keys[j]]['supervision']['action'][:]
+                next_obs = f[step_keys[min(j+1, end_idx)]]['obs']['birdview']['birdview'][:]
+                reward = f[step_keys[j]]['reward'][()]
+                trajectories.append([obs, action, next_obs, reward, terminal, False])
+                
+            s, a, s_n, r, terminal, timeout = zip(*trajectories)
+            s = torch.tensor(np.array(s).transpose(0, 3, 1, 2), dtype=torch.float32).contiguous().clone()
+            a = torch.tensor(np.array(a), dtype=torch.float32).contiguous().clone()
+            s_n = torch.tensor(np.array(s_n).transpose(0, 3, 1, 2), dtype=torch.float32).contiguous().clone()
+            r = torch.tensor(np.array(r), dtype=torch.float32).unsqueeze(1).contiguous().clone()
+            terminal = torch.tensor(np.array(terminal), dtype=torch.float32).unsqueeze(1).contiguous().clone()
+            timeout = torch.tensor(np.array(timeout), dtype=torch.float32).unsqueeze(1).contiguous().clone()
+            
+            return (s, a, s_n, r, terminal, timeout, cluster_label)
+        
+    def split_train_val(self):
+        val_mask = get_val_mask(len(self), self.val_ratio, self.seed)
+        train_idxs = [i for i, m in enumerate(val_mask) if not m]
+        val_idxs = [i for i, m in enumerate(val_mask) if m]
+        
+        train_dataset = copy.copy(self)
+        train_dataset.index_list = [self.filtered_index_list[i] for i in train_idxs]
+        train_dataset.filtered_cluster_labels = [self.filtered_cluster_labels[i] for i in train_idxs]
+        
+        val_dataset = copy.copy(self)
+        val_dataset.index_list = [self.filtered_index_list[i] for i in val_idxs]
+        val_dataset.filtered_cluster_labels = [self.filtered_cluster_labels[i] for i in val_idxs]
+        
+        return train_dataset, val_dataset

@@ -20,6 +20,7 @@ from model.opal import *
 from dataset.dataset import SubTrajDataset
 from utils.seed import seed_all
 
+
 def eval(encoder, 
          decoder, 
          prior, 
@@ -75,7 +76,7 @@ def train(encoder,
           wb,
           checkpoint_dir,
           cfg):
-    optimizer = optim.Adam(list(encoder.parameters()) + list(decoder.parameters()) + list(prior.parameters()), lr=cfg.lr)
+    optimizer = optim.AdamW(list(encoder.parameters()) + list(decoder.parameters()) + list(prior.parameters()), lr=cfg.lr)
     
     encoder = encoder.to(cfg.device)
     decoder = decoder.to(cfg.device)
@@ -204,8 +205,8 @@ def main(config):
         
     dataset = SubTrajDataset(seed=train_cfg.seed, cfg=data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
-    train_dataloader = DataLoader(train_dataset, batch_size=train_cfg.batch_size, shuffle=True, num_workers=train_cfg.num_workers)
-    val_dataloader = DataLoader(val_dataset, batch_size=train_cfg.batch_size, shuffle=True, num_workers=train_cfg.num_workers)
+    train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
     
     if cfg.verbose:
         print("Create Trajectory dataset")
@@ -229,9 +230,9 @@ def main(config):
         wandb.init(project=cfg.wandb_project,
                    config=OmegaConf.to_container(cfg, resolve=True))
         wandb.run.tags = cfg.wandb_tag
-        wandb.run.name = f"{cfg.wandb_name}-{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
+        wandb.run.name = f"{cfg.wandb_name}_{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
      
-    checkpoint_dir = os.path.join(os.path.dirname(os.getcwd()), f'opal/outputs/opal/{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}')
+    checkpoint_dir = os.path.join(os.path.dirname(os.getcwd()), f"opal/outputs/opal/{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
     

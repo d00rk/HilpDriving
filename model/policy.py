@@ -39,9 +39,14 @@ class GaussianPolicy(nn.Module):
         self.fc_logstd = nn.Linear(cfg.obs_feature_dim, action_dim)
         
     def forward(self, x):
+        if x.dim() == 4 and x.shape[1] != 3 and x.shape[-1] == 3:
+            x = x.permute(0, 3, 1, 2)
         x = self.feature_extractor(x)
         mu = self.fc_mu(x)
         logstd = self.fc_logstd(x)
+        
+        mu = torch.nan_to_num(mu, nan=0.0, posinf=1.0, neginf=-1.0)
+        logstd = torch.nan_to_num(logstd, nan=0.0, posinf=1.0, neginf=-1.0)
         return mu, logstd
     
     def initialize(self):
@@ -62,11 +67,15 @@ class GaussianPolicyforHilbert(GaussianPolicy):
         )
         
     def forward(self, x, z):
+        if x.dim() == 4 and x.shape[1] != 3 and x.shape[-1] == 3:
+            x = x.permute(0, 3, 1, 2)
         x = self.feature_extractor(x)
         xz = torch.cat([x, z], dim=-1)
         xz = self.fc(xz)
         mu = self.fc_mu(xz)
         logstd = self.fc_logstd(xz)
+        mu = torch.nan_to_num(mu, nan=0.0, posinf=1.0, neginf=-1.0)
+        logstd = torch.nan_to_num(logstd, nan=0.0, posinf=1.0, neginf=-1.0)
         return mu, logstd
     
     def initialize(self):

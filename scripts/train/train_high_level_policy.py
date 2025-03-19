@@ -21,7 +21,7 @@ from omegaconf import OmegaConf
 from model.hilp import HilbertRepresentation
 from model.value_function import TwinQ, ValueFunction
 from opal.model.policy import GaussianPolicy
-from dataset.dataset import HILPDataset
+from dataset.dataset import LatentDataset
 from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp
 from utils.seed import seed_all
 
@@ -348,7 +348,7 @@ def main(config):
     if cfg.verbose:
         print("Create HILP dataset")
         
-    dataset = HILPDataset(train_cfg.seed, train_cfg.gamma, hilbert_representation, data_cfg)
+    dataset = LatentDataset(train_cfg.seed, train_cfg.gamma, hilbert_representation, data_cfg)
     train_dataset, val_dataset = dataset.split_tran_val()
     train_dataloader = DataLoader(train_dataset, batch_size=train_cfg.train_batch_size, shuffle=True, num_workers=train_cfg.num_workers)
     val_dataloader = DataLoader(val_dataset, batch_size=train_cfg.val_batch_size, shuffle=True, num_workers=train_cfg.num_workers)

@@ -29,14 +29,17 @@ class Encoder(nn.Module):
         )
 
         self.gru = nn.GRU(input_size=cfg.obs_feature_dim + cfg.action_dim, 
-                          hidden_size=cfg.hidden_dim, 
+                          hidden_size=cfg.gru_hidden_dim, 
                           num_layers=cfg.gru_layers, 
                           bidirectional=True, 
                           batch_first=True)
         self.fc_mu = nn.Linear(cfg.hidden_dim * cfg.gru_layers, cfg.latent_dim)
         self.fc_logstd = nn.Linear(cfg.hidden_dim * cfg.gru_layers, cfg.latent_dim)
+        # print(f"Expected GRU input size: {cfg.obs_feature_dim + cfg.action_dim}")  # 66이어야 함
 
     def forward(self, states, actions):
+        if states.dim() == 5 and states.shape[2] != 3 and states.shape[-1] == 3:
+            states = states.permute(0, 1, 4, 2, 3)
         batch_size, seq_len, c, h, w = states.size()
         states = states.view(-1, c, h, w)
         features = self.feature_extractor(states)
@@ -88,6 +91,9 @@ class Decoder(nn.Module):
         self.fc_logstd = nn.Linear(cfg.hidden_dim, cfg.action_dim)
 
     def forward(self, state, latent):
+        if state.dim() == 4 and state.shape[1] != 3 and state.shape[-1] == 3:
+            state = state.permute(0, 3, 1, 2)
+        batch_size, c, h, w = state.shape
         state_features = self.feature_extractor(state)
         
         x = torch.cat([state_features, latent], dim=-1)

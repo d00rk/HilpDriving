@@ -47,6 +47,8 @@ class TwinQ(nn.Module):
         )
         
     def both(self, state, action):
+        if state.dim() == 4 and state.shape[1] != 3 and state.shape[-1] == 3:   
+            state = state.permute(0, 3, 1, 2)
         s = self.feature_extractor(state)
         sa = torch.cat([s, action], dim=-1)
         q1 = self.q1(sa).squeeze(-1)
@@ -88,6 +90,8 @@ class ValueFunction(nn.Module):
         )
         
     def forward(self, x):
+        if x.dim() == 4 and x.shape[1] != 3 and x.shape[-1] == 3:
+            x = x.permute(0, 3, 1, 2)
         x = self.feature_extractor(x)
         x = self.v(x)
         x = x.squeeze(-1)
@@ -116,6 +120,8 @@ class TwinQforHilbert(TwinQ):
         )
         
     def both(self, state, z, action):
+        if state.dim() == 4 and state.shape[1] != 3 and state.shape[-1] == 3:
+            state = state.permute(0, 3, 1, 2)
         s = self.feature_extractor(state)
         sza = torch.cat([s, z, action], dim=-1)
         q1 = self.q1(sza).squeeze(-1)
@@ -140,6 +146,8 @@ class ValueFunctionforHilbert(ValueFunction):
         )
         
     def forward(self, x, z):
+        if x.dim() == 4 and x.shape[1] != 3 and x.shape[-1] == 3:
+            x = x.permute(0, 3, 1, 2)
         x = self.feature_extractor(x)
         xz = torch.cat([x, z], dim=-1)
         xz = self.v(xz)

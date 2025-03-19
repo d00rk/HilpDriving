@@ -39,6 +39,7 @@ def eval(q_function,
         total_policy_loss = 0.0
         for i, (states, actions, next_states, rewards, terminals, _) in pbar:
             states, actions, next_states, rewards, terminals = states.to(cfg.device), actions.to(cfg.device), next_states.to(cfg.device), rewards.to(cfg.device), terminals.to(cfg.device)
+            batch_size, h, w, c = states.shape
             if cfg.algo == "iql":
                 q_target = target_q_function(states, actions)
                 next_v = v_function(next_states)
@@ -75,10 +76,10 @@ def eval(q_function,
                 random_actions = torch.rand(batch_size, cfg.num_random, act_dim, device=cfg.device)
                 random_actions = random_actions * (cfg.high - cfg.low) + cfg.low
                 
-                obs_expand = states.unsqueeze(1).expand(-1, cfg.num_random, -1)
+                obs_expand = states.unsqueeze(1).expand(-1, cfg.num_random, h, w, c)
                 random_actions = random_actions.view(batch_size * cfg.num_random, act_dim)
                 
-                q1_random, q2_random = q_function.both(obs_expand.reshape(batch_size * cfg.num_random, -1), random_actions)
+                q1_random, q2_random = q_function.both(obs_expand.reshape(batch_size * cfg.num_random, h, w, c), random_actions)
                 q1_random = q1_random.view(batch_size, cfg.num_random)
                 q2_random = q2_random.view(batch_size, cfg.num_random)
                 
@@ -124,7 +125,8 @@ def train(q_function,
           checkpoint_dir,
           cfg):
     q_function = q_function.to(cfg.device)
-    v_function = v_function.to(cfg.device)
+    if v_function is not None:
+        v_function = v_function.to(cfg.device)
     policy = policy.to(cfg.device)
     target_q_function = copy.deepcopy(q_function).requires_grad_(False).to(cfg.device)
     
@@ -152,6 +154,7 @@ def train(q_function,
         
         for i, (state, action, next_state, reward, terminal, _) in progress_bar:
             state, action, next_state, reward, terminal = state.to(cfg.device), action.to(cfg.device), next_state.to(cfg.device), reward.to(cfg.device), terminal.to(cfg.device)
+            batch_size, h, w, c = state.shape
             if cfg.algo == "iql":
                 with torch.no_grad():
                    q_target = target_q_function(state, action)
@@ -201,11 +204,10 @@ def train(q_function,
                 batch_size, act_dim = action.shape
                 random_actions = torch.rand(batch_size, cfg.num_random, act_dim, device=cfg.device)
                 random_actions = random_actions * (cfg.high - cfg.low) + cfg.low
-                
-                obs_expand = state.unsqueeze(1).expand(-1, cfg.num_random, -1)
+                obs_expand = state.unsqueeze(1).expand(-1, cfg.num_random, h, w, c)
                 random_actions = random_actions.view(batch_size * cfg.num_random, act_dim)
                 
-                q1_random, q2_random = q_function.both(obs_expand.reshape(batch_size * cfg.num_random, -1), random_actions)
+                q1_random, q2_random = q_function.both(obs_expand.reshape(batch_size * cfg.num_random, h, w, c), random_actions)
                 q1_random = q1_random.view(batch_size, cfg.num_random)
                 q2_random = q2_random.view(batch_size, cfg.num_random)
                 
@@ -274,7 +276,6 @@ def train(q_function,
                                   v_function=v_function,
                                   policy=policy,
                                   dataloader=val_dataloader, 
-                                  latent_dim=latent_dim,
                                   epoch=epoch,
                                   cfg=cfg)
             
@@ -335,8 +336,8 @@ def main(config):
         
     dataset = TrajectoryDataset(seed=train_cfg.seed, cfg=data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
-    train_dataloader = DataLoader(train_dataset, batch_size=train_cfg.batch_size, shuffle=True, num_workers=train_cfg.num_workers)
-    val_dataloader = DataLoader(val_dataset, batch_size=train_cfg.val_batch_size, shuffle=True, num_workers=train_cfg.num_workers)
+    train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
     
     if cfg.verbose:
         print("Created Dataset, DataLoader.")
@@ -366,7 +367,7 @@ def main(config):
         wandb.run.tags = cfg.wandb_tag
         wandb.run.name = f"{cfg.wandb_name}-{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
         
-    checkpoint_dir = os.path.join(os.path.dirname(os.getcwd()), f'opal/outputs/offline_rl/{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}')
+    checkpoint_dir = os.path.join(os.path.dirname(os.getcwd()), f"opal/outputs/offline_rl/{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
     

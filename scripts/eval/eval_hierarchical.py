@@ -20,7 +20,7 @@ import click
 from gym.wrappers.monitoring.video_recorder import ImageEncoder
 from stable_baselines3.common.vec_env.base_vec_env import tile_images
 
-from carla_gym.utils.config_utils import config_utils
+from carla_gym.utils import config_utils
 from utils.server_utils import kill_carla, CarlaServerManager
 from utils.wandb_callback import WandbCallback
 

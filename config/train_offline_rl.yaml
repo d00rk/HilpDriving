@@ -1,7 +1,7 @@
 data:
     data_algo: "roach_bc"
     data_benchmark: "leaderboard1"
-    data_town: ["Town03", "Town04", "Town06"]
+    data_town: ["Town06"]
     num_workers: 4
     train_batch_size: 128
     val_batch_size: 128
@@ -10,22 +10,22 @@ data:
 
 model:
     obs_dim: 192
-    action_dim: 3
-    latent_dim: 8
+    action_dim: 2
+    latent_dim: 10
     latent_as_action: false
     q_hidden_dim: 32
     v_hidden_dim: 32
-    obs_feature_dim: 64
+    obs_feature_dim: 128
 
 train:
-    algo: "iql"
-    device: "cuda:0"
+    algo: "cql"
+    device: "cuda:1"
     seed: 42
     num_epochs: 1000
     eval_frequency: 10
-    q_lr: 0.001
-    v_lr: 0.001
-    policy_lr: 0.001
+    q_lr: 0.0001
+    v_lr: 0.0001
+    policy_lr: 0.0001
     max_steps: 10000
     tau: 0.7
     beta: 3.0
@@ -41,6 +41,6 @@ resume: false
 resume_ckpt_dir: ""
 verbose: true
 wb: true
-wandb_project: "hilp"
-wandb_name: "train_high_level_policy_iql"
-wandb_tag: ["roach_bc", "leaderboard1", "Town04", "iql", "high-level-policy"]
+wandb_project: "offline_rl"
+wandb_name: "train_cql"
+wandb_tag: ["roach_bc", "leaderboard1", "Town06", "cql", "baseline"]

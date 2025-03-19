@@ -21,7 +21,7 @@ agent:
 carla_sh_path: /home/mkdusgml/carla_ws/carla0910/CarlaUE4.sh
 log_level: INFO
 host: localhost
-port: 2000
+port: 2010
 seed: 42
 no_rendering: false
 kill_running: true

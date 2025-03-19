@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from model.hilp import HilbertRepresentation
 from dataset.dataset import GoalDataset
@@ -62,7 +63,7 @@ def train_hilp(model,
     model = model.to(cfg.device)
     target_model = target_model.to(cfg.device)
     
-    optimizer = optim.SGD(model.parameters(), lr=cfg.lr)
+    optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
     
     if verbose:
         print(f"[Torch] {cfg.device} is used.")
@@ -94,7 +95,6 @@ def train_hilp(model,
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
             with torch.no_grad():
                 for param, target_param in zip(model.parameters(), target_model.parameters()):
                     target_param.data.copy_(cfg.tau * param.data + (1 - cfg.tau) * target_param.data)
@@ -119,6 +119,7 @@ def train_hilp(model,
                                   dataloader=val_dataloader, 
                                   epoch=epoch,
                                   total_epoch=cfg.num_epochs,
+                                  expectile_tau=cfg.expectile_tau,
                                   device=cfg.device)
             
             if verbose:
@@ -180,8 +181,8 @@ def main(config):
         
     dataset = GoalDataset(train_cfg.seed, data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
-    train_dataloader = DataLoader(train_dataset, batch_size=train_cfg.train_batch_size, shuffle=True, num_workers=train_cfg.num_workers)
-    val_dataloader = DataLoader(val_dataset, batch_size=train_cfg.val_batch_size, shuffle=True, num_workers=train_cfg.num_workers)
+    train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
     
     if cfg.verbose:
         print("Created Dataset, DataLoader.")
@@ -192,7 +193,7 @@ def main(config):
         wandb.run.tags = cfg.wandb_tag
         wandb.run.name = f"{cfg.wandb_name}-{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
     
-    checkpoint_dir = os.path.join(os.path.dirname(os.getcwd()), f'opal/outputs/hilp/{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}')
+    checkpoint_dir = os.path.join(os.path.dirname(os.getcwd()), f"opal/outputs/hilp/{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
     
