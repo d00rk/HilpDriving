@@ -1,7 +1,6 @@
 data:
-    data_algo: "roach_bc"
-    data_benchmark: "leaderboard1"
-    data_town: ["Town03", "Town04", "Town06"]
+    algo: "hilp"
+    data_town: ["Town01", "Town03", "Town04", "Town06"]
     num_workers: 4
     train_batch_size: 128
     val_batch_size: 128

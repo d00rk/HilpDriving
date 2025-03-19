@@ -124,8 +124,8 @@ def train(encoder,
             
             optimizer.zero_grad()
             loss.backward()
-            lr_scheduler.step()
             optimizer.step()
+            lr_scheduler.step()
             
             total_loss += loss.item()
             total_recon_loss += recon_loss.item()

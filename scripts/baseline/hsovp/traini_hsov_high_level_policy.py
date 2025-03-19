@@ -1,31 +1,30 @@
-"""
-Training High-Level Policy pi(z|s) with pretrained hilbert representation model.
-"""
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 
-import torch
-import torch.nn.functional as F
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
-import numpy as np
+import glob
 import wandb
 import datetime as dt
+import numpy as np
 import click
 import tqdm
 import copy
-import glob
 from omegaconf import OmegaConf
 
-from model.hilp import HilbertRepresentation
-from model.value_function import TwinQ, ValueFunction
-from model.policy import GaussianPolicy
-from dataset.dataset import LatentDataset
-from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp
-from utils.seed_utils import seed_all
+import torch
+import torch.nn.functional as F
+from torch.distributions import Normal
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
 
-EXP_ADV_MAX = 100.
+from model.hso_vp import Encoder
+from model.policy import GaussianPolicy
+from model.value_function import ValueFunction, TwinQ
+from dataset.dataset import LatentDataset
+from utils.seed_utils import seed_all
+from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp
+
+EXP_ADV_MAX = 100.0
 
 def eval(q_function,
          target_q_function,
@@ -116,8 +115,8 @@ def eval(q_function,
             eval_loss["eval/v_loss"] = avg_v_loss
         
         return eval_loss
-
-
+                
+    
 def train(q_function,
           v_function,
           policy, 
@@ -133,9 +132,9 @@ def train(q_function,
     policy = policy.to(cfg.device)
     target_q_function = copy.deepcopy(q_function).requires_grad_(False).to(cfg.device)
     
-    q_optimizer = torch.optim.Adam(q_function.parameters(), lr=cfg.q_lr)
-    policy_optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.policy_lr)
-    v_optimizer = torch.optim.Adam(v_function.parameters(), lr=cfg.v_lr) if v_function is not None else None
+    q_optimizer = torch.optim.AdamW(q_function.parameters(), lr=cfg.q_lr)
+    policy_optimizer = torch.optim.AdamW(policy.parameters(), lr=cfg.policy_lr)
+    v_optimizer = torch.optim.AdamW(v_function.parameters(), lr=cfg.v_lr) if v_function is not None else None
     policy_lr_scheduler = CosineAnnealingLR(policy_optimizer, cfg.max_steps)
     
     if verbose:
@@ -292,7 +291,7 @@ def train(q_function,
                 if verbose:
                     print(f"Save best model of epoch {epoch}")
                 
-                checkpoint_path = os.path.join(checkpoint_dir, f"hilbert_policy_{cfg.algo}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_epoch_{epoch}.pt")
+                checkpoint_path = os.path.join(checkpoint_dir, f"hsovp_high_level_policy_{cfg.algo}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_epoch_{epoch}.pt")
                 if cfg.algo == "iql":
                     torch.save({
                         'epoch': epoch,
@@ -316,45 +315,45 @@ def train(q_function,
         print(f"[Train] Finished at {dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}")
 
 
-
 @click.command()
-@click.option("-c", "--config", type=str, default='train_hilbert_polilcy', required=True, help="config file name")
+@click.option('-c', '--config', required=True, default='train_hsovp_high_level_policy', help='config file name')
 def main(config):
-    CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.getcwd())), f'config/{config}.yaml')
+    CONFIG_FILE = os.path.join(os.getcwd(), f'config/{config}.yaml')
     cfg = OmegaConf.load(CONFIG_FILE)
     
     if cfg.resume:
-        resume_conf = OmegaConf.load(os.path.dirname(os.path.dirname(os.getcwd())), f'outputs/hilbert_policy/{cfg.resume_ckpt_dir}/{config}.yaml'))
-        cfg.data = resume_conf.data
-        cfg.model = resume_conf.model
-        cfg.train = resume_conf.train
-        del resume_conf
+        resume_cfg = OmegaConf.load(os.path.join(os.getcwd(), f'outputs/hsovp_high_level_policy/{cfg.resume_ckpt_dir}/{config}.yaml'))
+        cfg.data = resume_cfg.data
+        cfg.model = resume_cfg.model
+        cfg.train = resume_cfg.train
+        del resume_cfg
     
     data_cfg = cfg.data
     model_cfg = cfg.model
     train_cfg = cfg.train
     
     seed_all(train_cfg.seed)
-
-    # pretrained hilbert representation model
-    HILP_DICT_PATH = os.path.join(os.getcwd()), f'outputs/hilp/{train_cfg.hilp_dir}/{train_cfg.hilp_dict_name}.pt')
-    hilbert_representation = HilbertRepresentation(model_cfg)
-    ckpt = torch.load(HILP_DICT_PATH)
-    hilbert_representation.load_state_dict(ckpt['hilbert_representation_state_dict'])
-    hilbert_representation.eval()
     
-    # Create Dataset, Dataloader
-    if cfg.verbose:
-        print("Create HILP dataset")
         
-    dataset = LatentDataset(train_cfg.seed, train_cfg.gamma, hilbert_representation, data_cfg)
-    train_dataset, val_dataset = dataset.split_tran_val()
-    train_dataloader = DataLoader(train_dataset, batch_size=train_cfg.train_batch_size, shuffle=True, num_workers=train_cfg.num_workers)
-    val_dataloader = DataLoader(val_dataset, batch_size=train_cfg.val_batch_size, shuffle=True, num_workers=train_cfg.num_workers)
+    ENCODER_DICT_PATH = os.path.join(os.getcwd(), f"outputs/hsovp/{train_cfg.hsovp_dir}/{train_cfg.hsovp_name}.pt")
+    encoder = Encoder(model_cfg)
+    ckpt = torch.load(ENCODER_DICT_PATH)
+    encoder.load_state_dict(ckpt['encoder_state_dict'])
+    encoder.eval()
     
+    
+    # Create dataset, dataloader
     if cfg.verbose:
-        print("Created Dataset, DataLoader.")
+        print("Create Latent Dataset.")
     
+    dataset = LatentDataset(seed=train_cfg.seed, gamma=train_cfg.gamma, encoder=encoder, cfg=data_cfg)
+    train_dataset, val_dataset = dataset.split_train_val()
+    train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
+ 
+    if cfg.verbose:
+        print("Created Dataset, Dataloader.")
+
     # Create model
     q_func = TwinQ(model_cfg)
     policy = GaussianPolicy(model_cfg)
@@ -362,7 +361,7 @@ def main(config):
     policy.initialize()
     
     if cfg.resume:
-        ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"outputs/hilbert_high_level_policy/{cfg.resume_ckpt_dir}/hilbert_policy_{cfg.train.algo}_*.pt")))
+        ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"outputs/hsovp_high_level_policy/{cfg.resume_ckpt_dir}", f"hsovp_high_level_policy_*.pt")))
         ckpt = torch.load(ckpts[-1])
         q_func.load_state_dict(ckpt['q_state_dict'])
         policy.load_state_dict(ckpt['policy_state_dict'])
@@ -374,20 +373,19 @@ def main(config):
             v_func.load_state_dict(ckpt['v_state_dict'])
     else:
         v_func = None
-    
+
     if cfg.wb:
-        wandb.init(project=cfg.wandb_project,
-                   config=OmegaConf.to_container(cfg, resolve=True))
+        wandb.init(project=cfg.wandb_project, config=OmegaConf.to_container(cfg, resolve=True))
         wandb.run.tags = cfg.wandb_tag
         wandb.run.name = f"{cfg.wandb_name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-    checkpoint_dir = os.path.join(os.path.dirname(os.path.dirname(os.getcwd())), f'outputs/hilbert_high_level_policy/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}')
+    checkpoint_dir = os.path.join(os.getcwd(), f"outputs/hsovp_high_level_policy/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     if cfg.verbose:
         print(f"Created output directory: {checkpoint_dir}.")
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
-    
-    train(q_function=q_func, 
+        
+    train(q_func=q_func,
           v_function=v_func, 
           policy=policy, 
           train_dataloader=train_dataloader,
@@ -398,6 +396,5 @@ def main(config):
           checkpoint_dir=checkpoint_dir,
           cfg=train_cfg)
     
-
-if __name__=="__main__":   
+if __name__=="__main__":
     main()

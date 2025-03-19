@@ -53,19 +53,26 @@ class Encoder(nn.Module):
         
         gru_input = torch.cat([state_features, action], dim=-1)
         gru_output, _ = self.gru(gru_input)
+        gru_output = torch.nan_to_num(gru_output, nan=0.0, posinf=1.0, neginf=-1.0)
         
         logits = self.discrete_fc(gru_output[:, -1, :])
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0, neginf=-1.0)
         discrete_y = F.gumbel_softmax(logits, tau=1.0, hard=True)
+        discrete_y = torch.nan_to_num(discrete_y, nan=0.0, posinf=1.0, neginf=-1.0)
         
         z_means = torch.stack([layer(gru_output[:, -1, :]) for layer in self.continuous_mean])
         z_log_stds = torch.stack([layer(gru_output[:, -1, :]) for layer in self.continuous_logstd])
         
         z_means = z_means.permute(1, 0, 2)
         z_log_stds = z_log_stds.permute(1, 0, 2)
-        z_stds = torch.exp(z_log_stds)
+        z_log_stds = torch.clamp(z_log_stds, min=-2, max=2)
+        z_stds = F.softplus(z_log_stds) + 1e-6
         
         z_mean = (discrete_y.unsqueeze(-1) * z_means).sum(dim=1)
         z_std = (discrete_y.unsqueeze(-1) * z_stds).sum(dim=1)
+        
+        z_mean = torch.nan_to_num(z_mean, nan=0.0, posinf=1.0, neginf=-1.0)
+        z_std = torch.nan_to_num(z_std, nan=1e-3, posinf=1.0, neginf=-1.0)
         
         return z_mean, z_std, logits, discrete_y
     
@@ -100,6 +107,7 @@ class Decoder(nn.Module):
                           batch_first=True)
         self.decoder = nn.Linear(cfg.gru_hidden_dim * 2, cfg.action_dim)
         
+        
     def forward(self, state, z):
         if state.dim() == 4 and state.shape[1] != 3 and state.shape[-1] == 3:
             state = state.permute(0, 3, 1, 2)
@@ -109,8 +117,9 @@ class Decoder(nn.Module):
 
         gru_input = torch.cat([state_features, z], dim=-1)
         gru_output, _ = self.gru(gru_input)
+        gru_output = torch.nan_to_num(gru_output, nan=0.0, posinf=1.0, neginf=-1.0)
         action = self.decoder(gru_output)
-
+        action = torch.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
         return action
     
     def initialize(self):
@@ -122,7 +131,7 @@ class Prior(nn.Module):
     def __init__(self, cfg):
         super(Prior, self).__init__()
         
-        self.bev_layer = nn.Sequential(
+        self.feature_extractor = nn.Sequential(
             nn.BatchNorm2d(3),
             nn.Conv2d(3, 8, 4, 4, 0),
             nn.BatchNorm2d(8),
@@ -151,18 +160,22 @@ class Prior(nn.Module):
         state_features = torch.nan_to_num(state_features, nan=0.0, posinf=1.0, neginf=-1.0)
         
         logits = self.discrete_fc(state_features)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0, neginf=-1.0)
         discrete_y = F.gumbel_softmax(logits, tau=1.0, hard=True)
-        
+        discrete_y = torch.nan_to_num(discrete_y, nan=0.0, posinf=1.0, neginf=-1.0)
         z_means = torch.stack([layer(state_features) for layer in self.continuous_mean])
         z_log_stds = torch.stack([layer(state_features) for layer in self.continuous_logstd])
         
         z_means = z_means.permute(1, 0, 2)
         z_log_stds = z_log_stds.permute(1, 0, 2)
-        
-        z_stds = torch.exp(z_log_stds)
+        z_log_stds = torch.clamp(z_log_stds, min=-10, max=2)
+        z_stds = torch.clamp(torch.exp(z_log_stds), min=1e-3)
         
         z_mean = (discrete_y.unsqueeze(-1) * z_means).sum(dim=1)
         z_std = (discrete_y.unsqueeze(-1) * z_stds).sum(dim=1)
+        
+        z_mean = torch.nan_to_num(z_mean, nan=0.0, posinf=1.0, neginf=-1.0)
+        z_std = torch.nan_to_num(z_std, nan=0.0, posinf=1.0, neginf=-1.0)
         
         return z_mean, z_std, logits, discrete_y
     

@@ -1,6 +1,6 @@
 data:
-    algo: "opal"
-    data_town: ["Town01", "Town03", "Town04", "Town06"]
+    algo: "hsovp"
+    data_town: ["Town01","Town03", "Town04", "Town06"]
     num_workers: 4
     train_batch_size: 128
     val_batch_size: 128
@@ -40,6 +40,6 @@ resume: false
 resume_ckpt_dir: ""
 verbose: true
 wb: true
-wandb_project: "opal"
-wandb_name: "train_opal_high_level_policy_iql"
-wandb_tag: ["leaderboard1", "Town01", "Town03", "Town04", "Town06", "iql", "high-level-policy"]
+wandb_project: "hso-vp"
+wandb_name: "train_hsovp_high_level_policy_iql"
+wandb_tag: ["Town01","Town03", "Town04", "Town06", "iql", "hsovp-igh-level-policy"]

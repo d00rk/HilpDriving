@@ -152,9 +152,9 @@ class GoalDataset(Dataset):
 
 
 # =============================================================================
-# HILPDataset: {(s, z, s', R, terminal)_0^T}
+# LatentDataset: {(s, z, s', R, terminal)_0^T}
 # =============================================================================
-class HILPDataset(Dataset):
+class LatentDataset(Dataset):
     def __init__(self, seed, gamma, encoder, cfg):
         self.seed = seed
         seed_all(self.seed)
@@ -470,12 +470,26 @@ class FilteredDataset(Dataset):
         
         self.filtered_index_list = [self.index_list[i] for i in selected_indices]
         self.filtered_cluster_labels = self.cluster_labels[selected_indices]
+        print(f"filtered_index_list length: {len(self.filtered_index_list)}")
+        print(f"filtered_cluster_labels length: {len(self.filtered_cluster_labels)}")
+
         
     def __len__(self):
         return len(self.filtered_index_list)
     
     def __getitem__(self, index):
         file_path, step_keys, start_idx, end_idx, terminal = self.filtered_index_list[index]
+        cluster_label = self.filtered_cluster_labels[index]
+        
+        trajectories = []
+        with h5py.File(file_path, 'r') as f:
+            for j in range(start_idx, end_idx + 1):
+                obs = f[step_keys[j]]['obs']['birdview']['rendered'][:]
+                action = f[step_keys[j]]['supervision']['action'][:]
+                next_obs = f[step_keys[min(j+1, end_idx)]]['obs']['birdview']['rendered'][:]
+                reward = f[step_keys[j]]['reward'][()]
+                trajectories.append([obs, action, next_obs, reward, terminal, False])
+                
         cluster_label = int(self.filtered_cluster_labels[index])
         trajectories = list()
         with h5py.File(file_path, 'r') as f:
@@ -502,11 +516,11 @@ class FilteredDataset(Dataset):
         val_idxs = [i for i, m in enumerate(val_mask) if m]
         
         train_dataset = copy.copy(self)
-        train_dataset.index_list = [self.filtered_index_list[i] for i in train_idxs]
+        train_dataset.filtered_index_list = [self.filtered_index_list[i] for i in train_idxs]
         train_dataset.filtered_cluster_labels = [self.filtered_cluster_labels[i] for i in train_idxs]
         
         val_dataset = copy.copy(self)
-        val_dataset.index_list = [self.filtered_index_list[i] for i in val_idxs]
+        val_dataset.filtered_index_list = [self.filtered_index_list[i] for i in val_idxs]
         val_dataset.filtered_cluster_labels = [self.filtered_cluster_labels[i] for i in val_idxs]
         
         return train_dataset, val_dataset
