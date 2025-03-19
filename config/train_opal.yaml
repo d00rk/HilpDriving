@@ -1,7 +1,5 @@
 data:
-    data_algo: "roach_bc"
-    data_benchmark: "leaderboard1"
-    data_town: ["Town06"]
+    data_town: ["Town01", "Town03", "Town04", "Town06"]
     num_workers: 4
     train_batch_size: 256
     val_batch_size: 256
@@ -11,9 +9,10 @@ data:
 model:
     obs_dim: 192
     action_dim: 2
-    latent_dim: 8
+    latent_dim: 10
     obs_feature_dim: 64
     hidden_dim: 128
+    gru_hidden_dim: 64
     gru_layers: 2
 
 train:
@@ -25,9 +24,9 @@ train:
     kl_weight: 1.0
 
 resume: false
-resume_ckpt_dir: "2025-03-17 11:23:51"
+resume_ckpt_dir: ""
 verbose: true
 wb: true
 wandb_project: "opal"
 wandb_name: "opal"
-wandb_tag: ["opal", "baseline", "roach_bc", "leaderboard1", "Town06"]
+wandb_tag: ["opal", "baseline", "leaderboard1", "Town01", "Town03", "Town04", "Town06"]

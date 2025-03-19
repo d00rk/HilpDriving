@@ -1,7 +1,8 @@
 import h5py
 import os
 import glob
-DATA_PATH = glob.glob(os.path.join(os.path.dirname(os.getcwd()), 'datasets/roach_bc/leaderboard1/*.hdf5'))
+
+DATA_PATH = glob.glob(os.path.join(os.path.dirname(os.getcwd()), 'data/*.hdf5'))
 
 def main():
     for dataset in DATA_PATH:

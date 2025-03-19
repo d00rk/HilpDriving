@@ -19,7 +19,7 @@ from model.value_function import TwinQ, ValueFunction
 from model.policy import GaussianPolicy
 from dataset.dataset import TrajectoryDataset
 from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp
-from utils.seed import seed_all
+from utils.seed_utils import seed_all
 
 EXP_ADV_MAX = 100.
 
@@ -314,11 +314,11 @@ def train(q_function,
 @click.command()
 @click.option("-c", "--config", type=str, required=True, default='train_offline_rl', help="config file name")
 def main(config):
-    CONFIG_FILE = os.path.join(os.path.dirname(os.getcwd()), f'opal/config/{config}.yaml')
+    CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.getcwd()))), f'config/{config}.yaml')
     cfg = OmegaConf.load(CONFIG_FILE)
     
     if cfg.resume:
-        resume_conf = OmegaConf.load(os.path.join(os.path.dirname(os.getcwd()), f'opal/outputs/offline_rl/{cfg.resume_ckpt_dir}/{config}.yaml'))
+        resume_conf = OmegaConf.load(os.path.dirname(os.path.dirname(os.path.dirname(os.getcwd()))), f'outputs/offline_rl/{cfg.resume_ckpt_dir}/{config}.yaml'))
         cfg.data = resume_conf.data
         cfg.model = resume_conf.model
         cfg.train = resume_conf.train
@@ -349,7 +349,7 @@ def main(config):
         
    
     if cfg.resume:
-        ckpts = sorted(glob.glob(os.path.join(os.path.dirname(os.getcwd()), f"opal/outputs/offline_rl/{cfg.resume_ckpt_dir}", f"offline_rl_{cfg.train.algo}_*.pt")))
+        ckpts = sorted(glob.glob(os.path.dirname(os.path.dirname(os.path.dirname(os.getcwd()))), f"outputs/offline_rl/{cfg.resume_ckpt_dir}/offline_rl_{cfg.train.algo}_*.pt")))
         ckpt = torch.load(ckpts[-1])
         q_func.load_state_dict(ckpt['q_state_dict'])
         policy.load_state_dict(ckpt['policy_state_dict'])
@@ -365,9 +365,9 @@ def main(config):
         wandb.init(project=cfg.wandb_project,
                    config=OmegaConf.to_container(cfg, resolve=True))
         wandb.run.tags = cfg.wandb_tag
-        wandb.run.name = f"{cfg.wandb_name}-{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
+        wandb.run.name = f"{cfg.wandb_name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-    checkpoint_dir = os.path.join(os.path.dirname(os.getcwd()), f"opal/outputs/offline_rl/{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}")
+    checkpoint_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.getcwd()))), f"outputs/offline_rl/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
     

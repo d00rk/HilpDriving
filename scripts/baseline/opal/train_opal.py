@@ -18,7 +18,7 @@ from torch.distributions import Normal
 
 from model.opal import *
 from dataset.dataset import SubTrajDataset
-from utils.seed import seed_all
+from utils.seed_utils import seed_all
 
 
 def eval(encoder, 
@@ -163,7 +163,7 @@ def train(encoder,
                 if verbose:
                     print(f"Save best model of epoch: {epoch}   |   Eval loss: {eval_loss}")
                 
-                checkpoint_path = os.path.join(checkpoint_dir, f"opal_{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}_epoch_{epoch}.pt")
+                checkpoint_path = os.path.join(checkpoint_dir, f"opal_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_epoch_{epoch}.pt")
                 torch.save({
                     'epoch': epoch,
                     'encoder_state_dict': encoder.state_dict(),
@@ -183,11 +183,11 @@ def train(encoder,
 @click.command()
 @click.option("-c", "--config", type=str, default='train_opal', required=True, help="config file name")
 def main(config):
-    CONFIG_FILE = os.path.join(os.path.dirname(os.getcwd()), f'opal/config/{config}.yaml')
+    CONFIG_FILE = os.path.join(os.getcwd(), f'config/{config}.yaml')
     cfg = OmegaConf.load(CONFIG_FILE)
     
     if cfg.resume:
-        resume_conf = OmegaConf.load(os.path.join(os.path.dirname(os.getcwd()), f'opal/outputs/opal/{cfg.resume_ckpt_dir}/{config}.yaml'))
+        resume_conf = OmegaConf.load(os.path.join(os.getcwd(), f'outputs/opal/{cfg.resume_ckpt_dir}/{config}.yaml'))
         cfg.data = resume_conf.data
         cfg.model = resume_conf.model
         cfg.train = resume_conf.train
@@ -209,7 +209,7 @@ def main(config):
     val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
     
     if cfg.verbose:
-        print("Create Trajectory dataset")
+        print("Create dataset, dataloader.")
     
     # Create model
     encoder = Encoder(model_cfg)
@@ -220,7 +220,7 @@ def main(config):
     prior.initialize()
     
     if cfg.resume:
-        ckpts = sorted(glob.glob(os.path.join(os.path.dirname(os.getcwd()), f"opal/outputs/opal/{cfg.resume_ckpt_dir}", f"opal_*.pt")))
+        ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"outputs/opal/{cfg.resume_ckpt_dir}/opal_*.pt")))
         ckpt = torch.load(ckpts[-1])
         encoder.load_state_dict(ckpt['encoder_state_dict'])
         decoder.load_state_dict(ckpt['decoder_state_dict'])
@@ -230,10 +230,12 @@ def main(config):
         wandb.init(project=cfg.wandb_project,
                    config=OmegaConf.to_container(cfg, resolve=True))
         wandb.run.tags = cfg.wandb_tag
-        wandb.run.name = f"{cfg.wandb_name}_{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
+        wandb.run.name = f"{cfg.wandb_name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
      
-    checkpoint_dir = os.path.join(os.path.dirname(os.getcwd()), f"opal/outputs/opal/{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}")
+    checkpoint_dir = os.path.join(os.getcwd(), f"outputs/opal/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
+    if cfg.verbose:
+        print(f"Created output directory: {checkpoint_dir}.")
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
     
     train(encoder=encoder, 

@@ -1,7 +1,5 @@
 data:
-    data_algo: "roach_bc"
-    data_benchmark: "leaderboard1"
-    data_town: ["Town06"]
+    data_town: ["Town01", "Town03", "Town04", "Town06"]
     p: 0.2
     num_workers: 4
     train_batch_size: 256
@@ -11,7 +9,7 @@ data:
 
 model:
     obs_dim: 192
-    action_dim: 3
+    action_dim: 2
     latent_dim: 10
     latent_as_action: false
 
@@ -26,9 +24,9 @@ train:
     epsilon: 1e-6
 
 resume: false
-resume_ckpt_dir: "2025-03-17 11:23:51"
+resume_ckpt_dir: ""
 verbose: true
 wb: true
 wandb_project: "hilbert"
 wandb_name: "hilbert-representation"
-wandb_tag: ["mine", "hilbert-representation", "roach_bc", "leaderboard1", "Town06"]
+wandb_tag: ["mine", "hilbert-representation", "leaderboard1", "Town01", "Town03", "Town04", "Town06"]

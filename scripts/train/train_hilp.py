@@ -20,7 +20,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from model.hilp import HilbertRepresentation
 from dataset.dataset import GoalDataset
-from utils.seed import seed_all
+from utils.seed_utils import seed_all
 from utils.utils import l2_expectile_loss
 
 def eval_hilp(model, 
@@ -131,7 +131,7 @@ def train_hilp(model,
                 if verbose:
                     print(f"Save best model of epoch {epoch}")
                 
-                checkpoint_path = os.path.join(checkpoint_dir, f"hilbert_representation_{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}_epoch_{epoch}.pt")
+                checkpoint_path = os.path.join(checkpoint_dir, f"hilbert_representation_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_epoch_{epoch}.pt")
                 
                 torch.save({
                     "epoch": epoch,
@@ -150,11 +150,11 @@ def train_hilp(model,
 @click.command()
 @click.option("-c", "--config", default="train_hilp", type=str, help="Config to use")
 def main(config):
-    CONFIG_FILE = os.path.join(os.path.dirname(os.getcwd()), f'opal/config/{config}.yaml')
+    CONFIG_FILE = os.path.join(os.getcwd(), f"config/{config}.yaml")
     cfg = OmegaConf.load(CONFIG_FILE)
 
     if cfg.resume:
-        resum_conf = OmegaConf.load(os.path.join(os.path.dirname(os.getcwd()), f'opal/outputs/hilp/{cfg.resume_ckpt_dir}/{config}.yaml'))
+        resum_conf = OmegaConf.load(os.getcwd(), f"outputs/hilp/{cfg.resume_ckpt_dir}/{config}.yaml")
         cfg.data = resum_conf.data
         cfg.model = resum_conf.model
         cfg.train = resum_conf.train
@@ -169,7 +169,7 @@ def main(config):
     target_model = HilbertRepresentation(model_cfg)
     target_model.load_state_dict(model.state_dict())
     if cfg.resume:
-        ckpts = sorted(glob.glob(os.path.join(os.path.dirname(os.getcwd()), f"opal/outputs/hilp/{cfg.resume_ckpt_dir}/hilp_*.pt")))
+        ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"outputs/hilp/{cfg.resume_ckpt_dir}/hilp_*.pt")))
         ckpt = torch.load(ckpts[-1])
         if cfg.verbose:
             print(f"Resume from {ckpts[-1]}")
@@ -191,12 +191,14 @@ def main(config):
         wandb.init(project=cfg.wandb_project,
                    config=OmegaConf.to_container(cfg, resolve=True))
         wandb.run.tags = cfg.wandb_tag
-        wandb.run.name = f"{cfg.wandb_name}-{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}"
+        wandb.run.name = f"{cfg.wandb_name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    checkpoint_dir = os.path.join(os.path.dirname(os.getcwd()), f"opal/outputs/hilp/{dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}")
+    checkpoint_dir = os.path.join(os.getcwd(), f"outputs/hilp/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
     
+    if cfg.verbose:
+        print(f"Created output directory: {checkpoint_dir}.")
     
     train_hilp(model=model, 
                target_model=target_model, 

@@ -33,8 +33,8 @@ class Encoder(nn.Module):
                           num_layers=cfg.gru_layers, 
                           bidirectional=True, 
                           batch_first=True)
-        self.fc_mu = nn.Linear(cfg.hidden_dim * cfg.gru_layers, cfg.latent_dim)
-        self.fc_logstd = nn.Linear(cfg.hidden_dim * cfg.gru_layers, cfg.latent_dim)
+        self.fc_mu = nn.Linear(2 * cfg.gru_hidden_dim, cfg.latent_dim)
+        self.fc_logstd = nn.Linear(2 * cfg.gru_hidden_dim, cfg.latent_dim)
         # print(f"Expected GRU input size: {cfg.obs_feature_dim + cfg.action_dim}")  # 66이어야 함
 
     def forward(self, states, actions):

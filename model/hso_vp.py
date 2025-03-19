@@ -35,9 +35,9 @@ class Encoder(nn.Module):
                          batch_first=True, 
                          bidirectional=True)
         
-        self.discrete_fc = nn.Linear(cfg.gru_hidden_dim * cfg.gru_layers, cfg.discrete_option)
-        self.continuous_mean = nn.ModuleList([nn.Linear(cfg.gru_hidden_dim * cfg.gru_layers, cfg.latent_dim) for _ in range(cfg.discrete_option)])
-        self.continuous_logstd = nn.ModuleList([nn.Linear(cfg.gru_hidden_dim * cfg.gru_layers, cfg.latent_dim) for _ in range(cfg.discrete_option)])
+        self.discrete_fc = nn.Linear(cfg.gru_hidden_dim * 2, cfg.discrete_option)
+        self.continuous_mean = nn.ModuleList([nn.Linear(cfg.gru_hidden_dim * 2, cfg.latent_dim) for _ in range(cfg.discrete_option)])
+        self.continuous_logstd = nn.ModuleList([nn.Linear(cfg.gru_hidden_dim * 2, cfg.latent_dim) for _ in range(cfg.discrete_option)])
         
         
     def forward(self, state, action):
@@ -98,7 +98,7 @@ class Decoder(nn.Module):
                           num_layers=cfg.gru_layers,
                           bidirectional=True,
                           batch_first=True)
-        self.decoder = nn.Linear(cfg.gru_hidden_dim * cfg.gru_layers, cfg.action_dim)
+        self.decoder = nn.Linear(cfg.gru_hidden_dim * 2, cfg.action_dim)
         
     def forward(self, state, z):
         if state.dim() == 4 and state.shape[1] != 3 and state.shape[-1] == 3:

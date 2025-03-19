@@ -13,7 +13,7 @@ from sklearn.cluster import KMeans
 import numpy as np
 
 from utils.sampler import get_val_mask
-from utils.seed import seed_all
+from utils.seed_utils import seed_all
 
 # =============================================================================
 # TrajectoryDataset: {(s, a, s', r, terminal, timeout)_0^T}
@@ -27,7 +27,7 @@ class TrajectoryDataset(Dataset):
         self.index_list = list()
         hdf5_paths = list()
         for t in cfg.data_town:
-            hp = glob.glob(os.path.join(os.path.dirname(os.getcwd()), f'datasets/{cfg.data_algo}/{cfg.data_benchmark}/{t.lower()}_*.hdf5'))
+            hp = glob.glob(os.path.join(os.path.dirname(os.getcwd()), f'data/{t.lower()}_*.hdf5'))
             hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
   
@@ -53,9 +53,9 @@ class TrajectoryDataset(Dataset):
         file_path, current_key, next_key, terminal = self.index_list[index]
         with h5py.File(file_path, 'r') as f:
             current_group = f[current_key]
-            current_obs = current_group['obs']['birdview']['birdview'][:]
+            current_obs = current_group['obs']['birdview']['rendered'][:]
             action = current_group['supervision']['action'][:]
-            next_obs = f[next_key]['obs']['birdview']['birdview'][:]
+            next_obs = f[next_key]['obs']['birdview']['rendered'][:]
             reward = current_group['reward'][()]
         current_obs_tensor = torch.tensor(current_obs, dtype=torch.float32)
         action_tensor = torch.tensor(action, dtype=torch.float32)
@@ -91,8 +91,7 @@ class GoalDataset(Dataset):
         
         hdf5_paths = list()
         for t in cfg.data_town:
-            hp = glob.glob(os.path.join(os.path.dirname(os.getcwd()),
-                                        f'datasets/{cfg.data_algo}/{cfg.data_benchmark}/{t.lower()}_*.hdf5'))
+            hp = glob.glob(os.path.join(os.getcwd(), f'data/{t.lower()}_*.hdf5'))
             hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
         
@@ -127,9 +126,9 @@ class GoalDataset(Dataset):
         file_path, current_key, next_key, goal_key = self.index_list[index]
         
         with h5py.File(file_path, 'r') as f:
-            current_obs = f[current_key]['obs']['birdview']['birdview'][:]
-            next_obs = f[next_key]['obs']['birdview']['birdview'][:]
-            goal_obs = f[goal_key]['obs']['birdview']['birdview'][:]
+            current_obs = f[current_key]['obs']['birdview']['rendered'][:]
+            next_obs = f[next_key]['obs']['birdview']['rendered'][:]
+            goal_obs = f[goal_key]['obs']['birdview']['rendered'][:]
             
         current_obs_tensor = torch.tensor(current_obs, dtype=torch.float32)
         next_obs_tensor = torch.tensor(next_obs, dtype=torch.float32)
@@ -167,8 +166,7 @@ class HILPDataset(Dataset):
         self.index_list = list()
         hdf5_paths = []
         for t in self.town:
-            hp = glob.glob(os.path.join(os.path.dirname(os.getcwd()), 
-                                        f'datasets/{cfg.data_algo}/{cfg.data_benchmark}/{t.lower()}_*.hdf5'))
+            hp = glob.glob(os.path.join(os.path.dirname(os.getcwd()), f'data/{t.lower()}_*.hdf5'))
             hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
         
@@ -195,8 +193,8 @@ class HILPDataset(Dataset):
     def __getitem__(self, index):
         file_path, current_key, end_key, terminal, start_idx, end_idx, step_keys = self.index_list[index]
         with h5py.File(file_path, 'r') as f:
-            current_obs = f[current_key]['obs']['birdview']['birdview'][:]
-            next_obs = f[end_key]['obs']['birdview']['birdview'][:]
+            current_obs = f[current_key]['obs']['birdview']['rendered'][:]
+            next_obs = f[end_key]['obs']['birdview']['rendered'][:]
             
             if self.algo == "hilp":
                 with torch.no_grad():
@@ -209,9 +207,9 @@ class HILPDataset(Dataset):
                 with torch.no_grad():
                     traj = []
                     for j in range(start_idx, end_idx):
-                        s = f[step_keys[j]]['obs']['birdview']['birdview'][:]
+                        s = f[step_keys[j]]['obs']['birdview']['rendered'][:]
                         a = f[step_keys[j]]['supervision']['action'][:]
-                        s_next = f[step_keys[min(j+1, end_idx)]]['obs']['birdview']['birdview'][:]
+                        s_next = f[step_keys[min(j+1, end_idx)]]['obs']['birdview']['rendered'][:]
                         r = f[step_keys[j]]['reward'][()]
                         terminal = f[step_keys[j]]['terminal'][()]
                         traj.append([s, a, s_next, r, terminal, False])
@@ -264,8 +262,7 @@ class SubTrajDataset(Dataset):
         self.val_ratio = cfg.val_ratio
         hdf5_paths = list()
         for t in cfg.data_town:
-            hp = glob.glob(os.path.join(os.path.dirname(os.getcwd()),
-                                          f'datasets/{cfg.data_algo}/{cfg.data_benchmark}/{t.lower()}_*.hdf5'))
+            hp = glob.glob(os.path.join(os.getcwd(), f'data/{t.lower()}_*.hdf5'))
             hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
         
@@ -289,9 +286,9 @@ class SubTrajDataset(Dataset):
         trajectories = []
         with h5py.File(file_path, 'r') as f:
             for j in range(start_idx, end_idx + 1):
-                obs = f[step_keys[j]]['obs']['birdview']['birdview'][:]
+                obs = f[step_keys[j]]['obs']['birdview']['rendered'][:]
                 action = f[step_keys[j]]['supervision']['action'][:]
-                next_obs = f[step_keys[min(j+1, end_idx)]]['obs']['birdview']['birdview'][:]
+                next_obs = f[step_keys[min(j+1, end_idx)]]['obs']['birdview']['rendered'][:]
                 reward = f[step_keys[j]]['reward'][()]
                 trajectories.append([obs, action, next_obs, reward, terminal, False])
         
@@ -425,9 +422,8 @@ class FilteredDataset(Dataset):
         self.cfg = cfg
         
         hdf5_paths = list()
-        for t in self.cfg.data_town:
-            hp = glob.glob(os.path.join(os.path.dirname(os.getcwd()),
-                                        f'datasets/{self.cfg.data_algo}/{self.cfg.data_benchmark}/{t.lower()}_*.hdf5'))
+        for t in cfg.data_town:
+            hp = glob.glob(os.path.join(os.getcwd(), f'data/{t.lower()}_*.hdf5'))
             hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
         
@@ -445,10 +441,10 @@ class FilteredDataset(Dataset):
                     terminal = (next_idx == epi_length - 1)
                     self.index_list.append((hdf5_path, step_keys, i, next_idx, terminal))
                     
-                    actions = ()
+                    actions = list()
                     for j in range(i, next_idx + 1):
                         action = f[step_keys[j]]['supervision']['action'][:]
-                        actions.append(actions.flatten())
+                        actions.append(action.flatten())
                     concat_action = np.concatenate(actions, axis=0)
                     action_feature_list.append(concat_action)
         self.action_features = np.array(action_feature_list)
@@ -484,9 +480,9 @@ class FilteredDataset(Dataset):
         trajectories = list()
         with h5py.File(file_path, 'r') as f:
             for j in range(start_idx, end_idx + 1):
-                obs = f[step_keys[j]]['obs']['birdview']['birdview'][:]
+                obs = f[step_keys[j]]['obs']['birdview']['rendered'][:]
                 action = f[step_keys[j]]['supervision']['action'][:]
-                next_obs = f[step_keys[min(j+1, end_idx)]]['obs']['birdview']['birdview'][:]
+                next_obs = f[step_keys[min(j+1, end_idx)]]['obs']['birdview']['rendered'][:]
                 reward = f[step_keys[j]]['reward'][()]
                 trajectories.append([obs, action, next_obs, reward, terminal, False])
                 
@@ -501,7 +497,7 @@ class FilteredDataset(Dataset):
             return (s, a, s_n, r, terminal, timeout, cluster_label)
         
     def split_train_val(self):
-        val_mask = get_val_mask(len(self), self.val_ratio, self.seed)
+        val_mask = get_val_mask(len(self), self.cfg.val_ratio, self.seed)
         train_idxs = [i for i, m in enumerate(val_mask) if not m]
         val_idxs = [i for i, m in enumerate(val_mask) if m]
         

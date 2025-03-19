@@ -20,7 +20,7 @@ from model.opal import Encoder
 from model.value_function import *
 from opal.model.policy import *
 from dataset.dataset import HighLevelDataset, SubTrajDataset
-from utils.seed import seed_all
+from utils.seed_utils import seed_all
 
 
 def eval(algo,

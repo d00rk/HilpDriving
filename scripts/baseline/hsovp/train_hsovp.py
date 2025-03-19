@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 
 from model.hso_vp import * 
 from dataset.dataset import FilteredDataset
-from utils.seed import seed_all
+from utils.seed_utils import seed_all
 
 
 def eval(encoder, 
@@ -189,11 +189,11 @@ def train(encoder,
 @click.command()
 @click.option('-c', '--config', required=True, default='train_hsovp', help='config file name')
 def main(config):
-    CONFIG_FILE = os.path.join(os.path.dirname(os.getcwd()), f'opal/config/{config}.yaml')
+    CONFIG_FILE = os.path.join(os.getcwd(), f'config/{config}.yaml')
     cfg = OmegaConf.load(CONFIG_FILE)
     
     if cfg.resume:
-        resume_cfg = OmegaConf.load(os.path.join(os.path.dirname(os.getcwd()), f'opal/outputs/hsovp/{cfg.resume_ckpt_dir}/{config}.yaml'))
+        resume_cfg = OmegaConf.load(os.path.join(os.getcwd(), f'outputs/hsovp/{cfg.resume_ckpt_dir}/{config}.yaml'))
         cfg.data = resume_cfg.data
         cfg.model = resume_cfg.model
         cfg.train = resume_cfg.train
@@ -226,7 +226,7 @@ def main(config):
     prior.initialize()
     
     if cfg.resume:
-        ckpts = sorted(glob.glob(os.path.join(os.path.dirname(os.getcwd()), f"opal/outputs/hsovp/{cfg.resume_ckpt_dir}", f"hsovp_*.pt")))
+        ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"outputs/hsovp/{cfg.resume_ckpt_dir}", f"hsovp_*.pt")))
         ckpt = torch.load(ckpts[-1])
         encoder.load_state_dict(ckpt['encoder_state_dict'])
         decoder.load_state_dict(ckpt['decoder_state_dict'])
@@ -237,7 +237,7 @@ def main(config):
         wandb.run.tags = cfg.wandb_tag
         wandb.run.name = f"{cfg.wandb_name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-    checkpoint_dir = os.path.join(os.path.dirname(os.getcwd()), f"opal/outputs/hsovp/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    checkpoint_dir = os.path.join(os.getcwd(), f"outputs/hsovp/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
         
