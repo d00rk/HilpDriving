@@ -29,6 +29,8 @@ def eval(encoder,
          dataloader,
          epoch,
          num_epochs,
+         beta_y,
+         beta_z,
          device):
     encoder = encoder.to(device)
     decoder = decoder.to(device)
@@ -51,11 +53,14 @@ def eval(encoder,
             prior_mu, prior_std, prior_logits, prior_discrete_y = prior(states[:, 0, :, :, :])
                 
             recon_loss = F.mse_loss(action_pred, actions[:, 0, :])
+            
+            q = F.softmax(logits, dim=-1)
+            p = F.softmax(prior_logits, dim=-1)
                              
-            kl_y = (logits * (torch.log(logits + 1e-8) - torch.log(prior_logits + 1e-8))).sum(dim=-1).mean()
+            kl_y = (q * (torch.log(q + 1e-8) - torch.log(p + 1e-8))).sum(dim=-1).mean()
             kl_z = ((torch.log(z_std + 1e-8) - torch.log(prior_std + 1e-8)) + (prior_std.pow(2) + (z_mu - prior_mu).pow(2)) / (2 * z_std.pow(2)) - 0.5).sum(dim=-1).mean()
                 
-            loss = recon_loss + 0.01 * kl_y + 0.01 * kl_z
+            loss = recon_loss + beta_y * kl_y + beta_z * kl_z
                 
             total_loss += loss.item()
             total_recon_loss += recon_loss.item()
@@ -115,10 +120,12 @@ def train(encoder,
 
             recon_loss = F.mse_loss(action_pred, actions[:, 0, :])
             
-            kl_y = (z_logits * (torch.log(z_logits + 1e-8) - torch.log(prior_logits + 1e-8))).sum(dim=-1).mean()
-            kl_z = ((torch.log(z_std + 1e-8) - torch.log(prior_std + 1e-8)) + (prior_std.pow(2) + (z_mu - prior_mu).pow(2)) / (2 * z_std.pow(2)) - 0.5).sum(dim=-1).mean()
+            q = F.softmax(z_logits, dim=-1)
+            p = F.softmax(prior_logits, dim=-1)
+            kl_y = (q * (torch.log(q + 1e-8) - torch.log(p + 1e-8))).sum(dim=-1).mean()
+            kl_z = (torch.log(prior_std + 1e-8) - torch.log(z_std + 1e-8) + (z_std.pow(2) + (z_mu - prior_mu).pow(2)) / (2 * prior_std.pow(2)) - 0.5).sum(dim=-1).mean()
             
-            loss = recon_loss + 0.01 * kl_y + 0.01 * kl_z
+            loss = recon_loss + cfg.beta_y * kl_y + cfg.beta_z * kl_z
             
             torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(decoder.parameters()) + list(prior.parameters()), max_norm=1.0)
             
@@ -156,7 +163,7 @@ def train(encoder,
             if verbose:
                 print(f"[Evaluation] {epoch} / {cfg.num_epochs}")
                 
-            eval_loss, eval_recon_loss, eval_kl_y_loss, eval_kl_z_loss = eval(encoder=encoder, decoder=decoder, prior=prior,  dataloader=val_dataloader, epoch=epoch, num_epochs=cfg.num_epochs, device=cfg.device)
+            eval_loss, eval_recon_loss, eval_kl_y_loss, eval_kl_z_loss = eval(encoder=encoder, decoder=decoder, prior=prior,  dataloader=val_dataloader, epoch=epoch, num_epochs=cfg.num_epochs, beta_y=cfg.beta_y, beta_z=cfg.beta_z, device=cfg.device)
             if verbose:
                 print(f"[Evaluation] Loss:  {eval_loss:.4f}")
             

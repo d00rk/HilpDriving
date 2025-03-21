@@ -24,7 +24,7 @@ train:
     kl_weight: 1.0
 
 resume: false
-resume_ckpt_dir: ""
+resume_ckpt_dir: "20250320_195645"
 verbose: true
 wb: true
 wandb_project: "opal"

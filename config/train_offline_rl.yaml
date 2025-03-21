@@ -1,5 +1,5 @@
 data:
-    data_town: ["Town01", "Town03", "Town04", Town06"]
+    data_town: ["Town01", "Town03", "Town04", "Town06"]
     num_workers: 4
     train_batch_size: 128
     val_batch_size: 128
@@ -16,7 +16,7 @@ model:
     obs_feature_dim: 128
 
 train:
-    algo: "cql"
+    algo: "iql"
     device: "cuda:1"
     seed: 42
     num_epochs: 1000
@@ -26,7 +26,7 @@ train:
     policy_lr: 0.0001
     max_steps: 10000
     tau: 0.7
-    beta: 3.0
+    beta: 0.5
     discount: 0.99
     alpha: 0.005
     num_random: 10
@@ -35,10 +35,10 @@ train:
     high: 1.0
     low: -1.0
 
-resume: false
-resume_ckpt_dir: ""
+resume: true
+resume_ckpt_dir: "20250319_225607"
 verbose: true
 wb: true
 wandb_project: "offline_rl"
-wandb_name: "train_cql"
-wandb_tag: ["roach_bc", "leaderboard1", "Town06", "cql", "baseline"]
+wandb_name: "train_iql"
+wandb_tag: ["leaderboard1", "Town01", "Town03", "Town04", "Town06", "iql", "baseline"]

@@ -27,7 +27,7 @@ class TrajectoryDataset(Dataset):
         self.index_list = list()
         hdf5_paths = list()
         for t in cfg.data_town:
-            hp = glob.glob(os.path.join(os.path.dirname(os.getcwd()), f'data/{t.lower()}_*.hdf5'))
+            hp = glob.glob(os.path.join(os.getcwd(), f'data/{t.lower()}_*.hdf5'))
             hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
   
@@ -117,13 +117,14 @@ class GoalDataset(Dataset):
                                 step = max_future_step
                                 break
                         goal_step_key = step_keys[min(i+step, epi_length-1)]
-                    self.index_list.append((hdf5_path, current_step_key, next_step_key, goal_step_key))
+                    done_mask = (current_step_key == next_step_key)
+                    self.index_list.append((hdf5_path, current_step_key, next_step_key, goal_step_key, done_mask))
                             
     def __len__(self):
         return len(self.index_list)
     
     def __getitem__(self, index):
-        file_path, current_key, next_key, goal_key = self.index_list[index]
+        file_path, current_key, next_key, goal_key, done_mask = self.index_list[index]
         
         with h5py.File(file_path, 'r') as f:
             current_obs = f[current_key]['obs']['birdview']['rendered'][:]
@@ -134,7 +135,7 @@ class GoalDataset(Dataset):
         next_obs_tensor = torch.tensor(next_obs, dtype=torch.float32)
         goal_obs_tensor = torch.tensor(goal_obs, dtype=torch.float32)
         
-        return (current_obs_tensor, next_obs_tensor, goal_obs_tensor)
+        return (current_obs_tensor, next_obs_tensor, goal_obs_tensor, done_mask)
     
     def split_train_val(self):
         val_mask = get_val_mask(len(self), self.val_ratio, self.seed)

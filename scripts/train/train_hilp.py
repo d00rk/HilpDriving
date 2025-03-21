@@ -28,12 +28,15 @@ def eval_hilp(model,
               dataloader, 
               epoch,
               total_epoch,
+              gamma,
               expectile_tau,
               device):
     pbar = tqdm.tqdm(enumerate(dataloader), total=len(dataloader), desc=f"[Validation] {epoch} / {total_epoch}", leave=True, ncols=100)
     with torch.no_grad():
+        model.eval()
+        target_model.eval()
         total_loss = 0.0
-        for i, (state, next_state, goal) in pbar:
+        for i, (state, next_state, goal, done_mask) in pbar:
             state, next_state, goal = state.to(device), next_state.to(device), goal.to(device)
             
             phi_s = model(state)
@@ -41,10 +44,16 @@ def eval_hilp(model,
             phi_next_s = target_model(next_state).detach()
             phi_next_g = target_model(goal).detach()
                         
-            temporal_dist = torch.norm(phi_s - phi_g, dim=-1)
-            target_dist = -torch.norm(phi_next_s - phi_next_g, dim=-1)
-            loss = l2_expectile_loss(target_dist - temporal_dist, expectile_tau)
+            temporal_dist = torch.norm(phi_s - phi_g, dim=-1)       # (256)
             
+            reward = -1.0 * (~done_mask).float().to(device)
+            # gamma_mask = (~done_mask).float().to(cfg.device)
+            
+            target_dist = gamma * torch.norm(phi_next_s - phi_next_g, dim=-1)
+            delta = reward + target_dist + temporal_dist
+
+            loss = l2_expectile_loss(delta, expectile_tau)
+
             total_loss += loss.item()
             
         avg_loss = total_loss / len(dataloader)
@@ -64,6 +73,7 @@ def train_hilp(model,
     target_model = target_model.to(cfg.device)
     
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
+    lr_scheduler = CosineAnnealingLR(optimizer, T_max=cfg.num_epochs)
     
     if verbose:
         print(f"[Torch] {cfg.device} is used.")
@@ -78,19 +88,25 @@ def train_hilp(model,
                                 desc=f"[Train] Epoch {epoch}/{cfg.num_epochs}", 
                                 leave=True, ncols=100)
         
-        for i, (state, next_state, goal) in progress_bar:
+        for i, (state, next_state, goal, done_mask) in progress_bar:
             state, next_state, goal = state.to(cfg.device), next_state.to(cfg.device), goal.to(cfg.device)
             
             # phi(s), phi(g)
-            phi_s = model(state)
-            phi_g = model(goal)
+            phi_s = model(state)        # (256, 10)
+            phi_g = model(goal)         # (256, 10)
             # target_phi(s'), target_phi(g) 
-            target_phi_next_s = target_model(next_state).detach()
-            target_phi_g = target_model(goal).detach()
+            target_phi_next_s = target_model(next_state).detach() # (256, 10)
+            target_phi_g = target_model(goal).detach()           # (256, 10)
                 
-            temporal_dist = torch.norm(phi_s - phi_g, dim=-1)
-            target_dist = -torch.norm(target_phi_next_s - target_phi_g, dim=-1)
-            loss = l2_expectile_loss(target_dist - temporal_dist, cfg.expectile_tau)
+            temporal_dist = torch.norm(phi_s - phi_g, dim=-1)       # (256)
+            
+            reward = -1.0 * (~done_mask).float().to(cfg.device)
+            # gamma_mask = (~done_mask).float().to(cfg.device)
+            
+            target_dist = cfg.gamma * torch.norm(target_phi_next_s - target_phi_g, dim=-1)
+            delta = reward + target_dist + temporal_dist
+
+            loss = l2_expectile_loss(delta, cfg.expectile_tau)
             
             optimizer.zero_grad()
             loss.backward()
@@ -104,21 +120,25 @@ def train_hilp(model,
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
             
         avg_loss = total_loss / len(train_dataloader)
+        lr_scheduler.step()
         
         if verbose:
             print(f"[Train] Epoch {epoch}/{cfg.num_epochs}   |   Loss: {avg_loss:.4f}")
         
         if wb:
             wandb.log({"train/epoch": epoch,
-                       "train/loss": avg_loss})
+                       "train/global_step": global_step,
+                       "train/loss": avg_loss,
+                       "train/lr": lr_scheduler.get_last_lr()[0]})
         
-        
+         
         if epoch % cfg.eval_frequency == 0:               
             eval_loss = eval_hilp(model=model, 
                                   target_model=target_model, 
                                   dataloader=val_dataloader, 
                                   epoch=epoch,
                                   total_epoch=cfg.num_epochs,
+                                  gamma=cfg.gamma,
                                   expectile_tau=cfg.expectile_tau,
                                   device=cfg.device)
             
@@ -154,7 +174,7 @@ def main(config):
     cfg = OmegaConf.load(CONFIG_FILE)
 
     if cfg.resume:
-        resum_conf = OmegaConf.load(os.getcwd(), f"outputs/hilp/{cfg.resume_ckpt_dir}/{config}.yaml")
+        resum_conf = OmegaConf.load(os.path.join(os.getcwd(), f"outputs/hilp/{cfg.resume_ckpt_dir}/{config}.yaml"))
         cfg.data = resum_conf.data
         cfg.model = resum_conf.model
         cfg.train = resum_conf.train
@@ -169,12 +189,12 @@ def main(config):
     target_model = HilbertRepresentation(model_cfg)
     target_model.load_state_dict(model.state_dict())
     if cfg.resume:
-        ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"outputs/hilp/{cfg.resume_ckpt_dir}/hilp_*.pt")))
+        ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"outputs/hilp/{cfg.resume_ckpt_dir}/hilbert_representation_*.pt")))
         ckpt = torch.load(ckpts[-1])
         if cfg.verbose:
             print(f"Resume from {ckpts[-1]}")
-        model.load_state_dict(ckpt["hilp_state_dict"])
-        target_model.load_state_dict(ckpt["hilp_state_dict"])
+        model.load_state_dict(ckpt["hilbert_representation_state_dict"])
+        target_model.load_state_dict(ckpt["hilbert_representation_state_dict"])
     
     if cfg.verbose:
         print("Create dataset")

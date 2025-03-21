@@ -20,8 +20,8 @@ from omegaconf import OmegaConf
 
 from model.hilp import HilbertRepresentation
 from model.value_function import TwinQforHilbert, ValueFunctionforHilbert
-from opal.model.policy import GaussianPolicyforHilbert
-from dataset.dataset import TrajectoryDataset
+from model.policy import GaussianPolicyforHilbert
+from dataset.dataset import SubTrajectoryDataset
 from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp
 from utils.seed_utils import seed_all
 from utils.sampler import sample_latent_vectors
@@ -46,29 +46,36 @@ def eval(model,
         total_policy_loss = 0.0
         for i, (states, actions, next_states, _, terminals, _) in pbar:
             states, actions, next_states, terminals = states.to(cfg.device), actions.to(cfg.device), next_states.to(cfg.device), terminals.to(cfg.device)
-            batch_size, _ = actions.shape
+            _, _, a, b, c = states.shape
+            batch_size, seq_len, _ = actions.shape
             z = sample_latent_vectors(batch_size=batch_size, latent_dim=latent_dim)
-            z_next = sample_latent_vectors(batch_size=batch_size, latent_dim=latent_dim)
+            z_expand = z.unsqueeze(1).expand(batch_size, seq_len, latent_dim).contiguous().view(batch_size*seq_len, latent_dim)
+            
+            states = states.view(batch_size * seq_len, a, b, c)
+            actions = actions.view(batch_size * seq_len, -1)
+            next_states = next_states.view(batch_size * seq_len, a, b, c)
+            terminals = terminals.view(batch_size * seq_len)
+            
             phi_s = model(states)
             phi_next_s = model(next_states)
             phi_s = phi_s.detach().cpu()
             phi_next_s = phi_next_s.detach().cpu()
-            intrinsic_reward = torch.sum((phi_next_s - phi_s) * z, dim=-1)
+            intrinsic_reward = torch.sum((phi_next_s - phi_s) * z_expand.cpu(), dim=-1)
             intrinsic_reward = intrinsic_reward.to(cfg.device)
             
             if cfg.algo == "iql":
-                q_target = target_q_function(states, z, actions)
-                next_v = v_function(next_states, z_next)
-                v = v_function(states, z)
+                q_target = target_q_function(states, z_expand, actions)
+                next_v = v_function(next_states, z_expand)
+                v = v_function(states, z_expand)
                 adv = q_target - v
                 v_loss = asymmetric_l2_loss(adv, cfg.tau)
                 
                 targets = intrinsic_reward + (1.0 - terminals) * cfg.discount * next_v.detach()
-                q1, q2 = q_function.both(states, z, actions)
+                q1, q2 = q_function.both(states, z_expand, actions)
                 q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
                 
                 exp_adv = torch.exp(cfg.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
-                a_mu, a_logstd = policy(states, z)
+                a_mu, a_logstd = policy(states, z_expand)
                 a_pred = torch.distributions.Normal(a_mu, a_logstd.exp()).rsample()
                 bc_losses = torch.sum((a_pred - actions)**2, dim=1)
                 policy_loss = torch.mean(exp_adv * bc_losses)
@@ -80,12 +87,12 @@ def eval(model,
                 total_policy_loss += policy_loss.item()
             
             elif cfg.algo == 'cql':
-                a_next_mu, a_next_logstd = policy(next_states, z_next)
+                a_next_mu, a_next_logstd = policy(next_states, z_expand)
                 a_next_pred = torch.distributions.Normal(a_next_mu, a_next_logstd.exp()).rsample()
-                q_next_target = target_q_function(next_states, z_next, a_next_pred)
+                q_next_target = target_q_function(next_states, z_expand, a_next_pred)
                 target_q = intrinsic_reward + (1.0 - terminals) * cfg.discount * q_next_target
                 
-                q1, q2 = q_function.both(states, z, actions)
+                q1, q2 = q_function.both(states, z_expand, actions)
                 q_loss = sum(F.mse_loss(q, target_q) for q in [q1, q2]) / 2
                 
                 batch_size, act_dim = actions.shape
@@ -106,10 +113,10 @@ def eval(model,
                 cql_loss_total = cfg.cql_alpha * (cql_q1 + cql_q2)
                 t_q_loss = q_loss + cql_loss_total
                 
-                a_mu, a_logstd = policy(states, z)
+                a_mu, a_logstd = policy(states, z_expand)
                 a_pred = torch.distributions.Normal(a_mu, a_logstd.exp()).rsample()
                 log_prob = torch.distributions.Normal(a_mu, a_logstd.exp()).log_prob(a_pred).sum(dim=-1)
-                q_new = q_function(states, z, a_pred)
+                q_new = q_function(states, z_expand, a_pred)
                 policy_loss = (0.2 * log_prob - q_new).mean()
                 
                 loss = t_q_loss.item() + policy_loss.item()
@@ -148,9 +155,9 @@ def train(model,
     policy = policy.to(cfg.device)
     target_q_function = copy.deepcopy(q_function).requires_grad_(False).to(cfg.device)
     
-    q_optimizer = torch.optim.Adam(q_function.parameters(), lr=cfg.q_lr)
-    policy_optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.policy_lr)
-    v_optimizer = torch.optim.Adam(v_function.parameters(), lr=cfg.v_lr) if v_function is not None else None
+    q_optimizer = torch.optim.AdamW(q_function.parameters(), lr=cfg.q_lr)
+    policy_optimizer = torch.optim.AdamW(policy.parameters(), lr=cfg.policy_lr)
+    v_optimizer = torch.optim.AdamW(v_function.parameters(), lr=cfg.v_lr) if v_function is not None else None
     
     policy_lr_scheduler = CosineAnnealingLR(policy_optimizer, cfg.max_steps)
     
@@ -176,22 +183,30 @@ def train(model,
         
         for i, (state, action, next_state, _, terminal, _) in progress_bar:
             state, action, next_state, terminal = state.to(cfg.device), action.to(cfg.device), next_state.to(cfg.device), terminal.to(cfg.device)
-            batch_size, _ = action.shape
+            _, _, a, b, c = state.shape
+            batch_size, seq_len, _ = action.shape
+            
             z = sample_latent_vectors(batch_size=batch_size, latent_dim=latent_dim)
-            z_next = sample_latent_vectors(batch_size=batch_size, latent_dim=latent_dim)
+            z_expand = z.unsqueeze(1).expand(batch_size, seq_len, latent_dim).contiguous().view(batch_size*seq_len, latent_dim)      
+            
+            state = state.view(batch_size * seq_len, a, b, c)
+            action = action.view(batch_size * seq_len, -1)
+            next_state = next_state.view(batch_size * seq_len, a, b, c)
+            terminal = terminal.view(batch_size * seq_len)
+            
             with torch.no_grad():
                 phi_s = model(state)
                 phi_next_s = model(next_state)
             phi_s = phi_s.detach().cpu()
             phi_next_s = phi_next_s.detach().cpu()
-            intrinsic_reward = torch.sum((phi_next_s-phi_s) * z, dim=-1)
+            intrinsic_reward = torch.sum((phi_next_s-phi_s) * z_expand.cpu(), dim=-1)
             intrinsic_reward = intrinsic_reward.to(cfg.device)
             
             if cfg.algo == "iql":
                 with torch.no_grad():
-                   q_target = target_q_function(state, z, action)
-                   next_v = v_function(next_state, z_next)
-                v = v_function(state, z)
+                   q_target = target_q_function(state, z_expand, action)
+                   next_v = v_function(next_state, z_expand)
+                v = v_function(state, z_expand)
                 adv = q_target - v
                 v_loss = asymmetric_l2_loss(adv, cfg.tau)
                 v_optimizer.zero_grad(set_to_none=True)
@@ -225,9 +240,9 @@ def train(model,
             
             elif cfg.algo == 'cql':
                 with torch.no_grad():
-                    a_next_mu, a_next_logstd = policy(next_state, z_next)
+                    a_next_mu, a_next_logstd = policy(next_state, z_expand)
                     a_next_pred = torch.distributions.Normal(a_next_mu, a_next_logstd.exp()).rsample()
-                    q_next_target = target_q_function(next_state, z_next, a_next_pred)
+                    q_next_target = target_q_function(next_state, z_expand, a_next_pred)
                     target_q = intrinsic_reward + (1.0 - terminal) * cfg.discount * q_next_target
                 
                 q1, q2 = q_function.both(state, z, action)
@@ -376,7 +391,7 @@ def main(config):
     if cfg.verbose:
         print("Create trajectory dataset")
         
-    dataset = TrajectoryDataset(train_cfg.seed, data_cfg)
+    dataset = SubTrajectoryDataset(train_cfg.seed, data_cfg)
     train_dataset, val_dataset = dataset.split_tran_val()
     train_dataloader = DataLoader(train_dataset, batch_size=train_cfg.train_batch_size, shuffle=True, num_workers=train_cfg.num_workers)
     val_dataloader = DataLoader(val_dataset, batch_size=train_cfg.val_batch_size, shuffle=True, num_workers=train_cfg.num_workers)

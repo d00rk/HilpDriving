@@ -101,16 +101,25 @@ def train(encoder,
         
         for i, (state, action, next_state, _, terminal, _) in progress_bar:
             state, action, next_state, terminal = state.to(cfg.device), action.to(cfg.device), next_state.to(cfg.device), terminal.to(cfg.device)
+            _, length, _, _, _ = state.shape
             latent_mu, latent_logstd = encoder(state, action)
             latent_std = torch.exp(0.5 * torch.clamp(latent_logstd, min=-10, max=10))
             latent_std = torch.clamp(latent_std, min=1e-6)
             z = Normal(latent_mu, latent_std).rsample()
             
-            action_mu, action_logstd = decoder(state[:, 0, :], z)
-            prior_mu, prior_logstd = prior(state[:, 0, :])
+            if z.dim() == 2:
+                z = z.unsqueeze(1).expand(-1, length, -1)
             
+            recon_losses = list()
+            for t in range(length):
+                action_mu_t, action_logstd_t = decoder(state[:, t, :], z[:, t, :])
+                step_loss = nn.MSELoss()(action_mu_t, action[:, t, :])
+                recon_losses.append(step_loss)
+
+            reconstruction_loss = torch.stack(recon_losses).mean()
+            
+            prior_mu, prior_logstd = prior(state[:, 0, :])
             kl_loss = 0.5 * torch.mean(prior_logstd - latent_logstd + (torch.exp(latent_logstd) + (latent_mu - prior_mu).pow(2)) / torch.exp(prior_logstd) - 1)
-            reconstruction_loss = nn.MSELoss()(action_mu, action[:, 0, :])
             
             loss = reconstruction_loss + cfg.kl_weight * kl_loss
             
