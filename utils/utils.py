@@ -42,6 +42,13 @@ def initialize_weights(m):
                 nn.init.orthogonal_(param)
             elif 'bias' in name:
                 nn.init.zeros_(param)
+                
+def get_reward_statics(dataloader):
+    rewards = list()
+    for _, _, _, r, _, _ in dataloader:
+        rewards.append(r)
+    rewards = torch.cat(rewards, dim=0)
+    return rewards.mean(), rewards.std()
 
 def parse_route_xml(route_xml):
     tree = ET.parse(route_xml)

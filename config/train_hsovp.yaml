@@ -28,7 +28,7 @@ train:
     beta_z: 0.01
 
 resume: true
-resume_ckpt_dir: "20250321_084309"
+resume_ckpt_dir: "20250323_010905"
 verbose: true
 wb: true
 wandb_project: "hso-vp"

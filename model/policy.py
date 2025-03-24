@@ -65,6 +65,8 @@ class GaussianPolicyforHilbert(GaussianPolicy):
             nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
             nn.ReLU()
         )
+        self.fc_mu = nn.Linear(cfg.hidden_dim, cfg.action_dim)
+        self.fc_logstd = nn.Linear(cfg.hidden_dim, cfg.action_dim)
         
     def forward(self, x, z):
         if x.dim() == 4 and x.shape[1] != 3 and x.shape[-1] == 3:

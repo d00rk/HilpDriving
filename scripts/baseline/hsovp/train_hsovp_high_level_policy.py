@@ -22,7 +22,7 @@ from model.policy import GaussianPolicy
 from model.value_function import ValueFunction, TwinQ
 from dataset.dataset import LatentDataset
 from utils.seed_utils import seed_all
-from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp
+from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp, get_reward_statics
 
 EXP_ADV_MAX = 100.0
 
@@ -30,6 +30,8 @@ def eval(q_function,
          target_q_function,
          v_function,
          policy, 
+         reward_mean,
+         reward_std,
          dataloader,
          epoch,
          cfg):
@@ -42,6 +44,7 @@ def eval(q_function,
         total_policy_loss = 0.0
         for i, (states, zs, next_states, rewards, terminals, _) in pbar:
             states, zs, next_states, rewards, terminals = states.to(cfg.device), zs.to(cfg.device), next_states.to(cfg.device), rewards.to(cfg.device), terminals.to(cfg.device)
+            normalized_reward = (rewards - reward_mean) / (reward_std + 1e-6)
             if cfg.algo == "iql":
                 q_target = target_q_function(states, zs)
                 next_v = v_function(next_states)
@@ -49,7 +52,7 @@ def eval(q_function,
                 adv = q_target - v
                 v_loss = asymmetric_l2_loss(adv, cfg.tau)
                 
-                targets = rewards + (1.0 - terminals) * cfg.discount * next_v.detach()
+                targets = normalized_reward + (1.0 - terminals) * cfg.discount * next_v.detach()
                 q1, q2 = q_function.both(states, zs)
                 q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
                 
@@ -69,7 +72,7 @@ def eval(q_function,
                 z_next_mu, z_next_logstd = policy(next_states)
                 z_next_pred = torch.distributions.Normal(z_next_mu, z_next_logstd.exp()).rsample()
                 q_next_target = target_q_function(next_states, z_next_pred)
-                target_q = rewards + (1.0 - terminals) * cfg.discount * q_next_target
+                target_q = normalized_reward + (1.0 - terminals) * cfg.discount * q_next_target
                 
                 q1, q2 = q_function.both(states, zs)
                 q_loss = sum(F.mse_loss(q, target_q) for q in [q1, q2]) / 2
@@ -121,8 +124,11 @@ def train(q_function,
           v_function,
           policy, 
           train_dataloader, 
-          val_dataloader,  
-          latent_dim,
+          val_dataloader,
+          train_reward_mean,
+          train_reward_std,
+          val_reward_mean,
+          val_reward_std,
           verbose,
           wb,
           checkpoint_dir,
@@ -156,6 +162,7 @@ def train(q_function,
         
         for i, (state, z, next_state, reward, terminal, _) in progress_bar:
             state, z, next_state, reward, terminal = state.to(cfg.device), z.to(cfg.device), next_state.to(cfg.device), reward.to(cfg.device), terminal.to(cfg.device)
+            normalized_reward = (reward - train_reward_mean) / (train_reward_std + 1e-6)
             if cfg.algo == "iql":
                 with torch.no_grad():
                    q_target = target_q_function(state, z)
@@ -167,7 +174,7 @@ def train(q_function,
                 v_loss.backward()
                 v_optimizer.step()
                 
-                targets = reward + (1.0 - terminal) * cfg.discount * next_v.detach()
+                targets = normalized_reward + (1.0 - terminal) * cfg.discount * next_v.detach()
                 q1, q2 = q_function.both(state, z)
                 q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
                 q_optimizer.zero_grad(set_to_none=True)
@@ -197,7 +204,7 @@ def train(q_function,
                     z_next_mu, z_next_logstd = policy(next_state)
                     z_next_pred = torch.distributions.Normal(z_next_mu, z_next_logstd.exp()).rsample()
                     q_next_target = target_q_function(next_state, z_next_pred)
-                    target_q = reward + (1.0 - terminal) * cfg.discount * q_next_target
+                    target_q = normalized_reward + (1.0 - terminal) * cfg.discount * q_next_target
                 
                 q1, q2 = q_function.both(state, z)
                 q_loss = sum(F.mse_loss(q, target_q) for q in [q1, q2]) / 2
@@ -278,7 +285,8 @@ def train(q_function,
                                   v_function=v_function,
                                   policy=policy,
                                   dataloader=val_dataloader, 
-                                  latent_dim=latent_dim,
+                                  reward_mean=val_reward_mean,
+                                  reward_std=val_reward_std,
                                   epoch=epoch,
                                   cfg=cfg)
             
@@ -287,7 +295,7 @@ def train(q_function,
             if wb:
                 wandb.log(eval_loss_dict)
                 
-            if eval_loss_dict['eval/loss'] <= best_loss:
+            if eval_loss_dict['eval/policy_loss'] <= best_loss:
                 if verbose:
                     print(f"Save best model of epoch {epoch}")
                 
@@ -346,10 +354,12 @@ def main(config):
     if cfg.verbose:
         print("Create Latent Dataset.")
     
-    dataset = LatentDataset(seed=train_cfg.seed, gamma=train_cfg.gamma, encoder=encoder, cfg=data_cfg)
+    dataset = LatentDataset(seed=train_cfg.seed, gamma=train_cfg.discount, encoder=encoder, cfg=data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
     train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
     val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
+    train_reward_mean, train_reward_std = get_reward_statics(train_dataloader)
+    val_reward_mean, val_reward_std = get_reward_statics(val_dataloader)
  
     if cfg.verbose:
         print("Created Dataset, Dataloader.")
@@ -385,12 +395,15 @@ def main(config):
         print(f"Created output directory: {checkpoint_dir}.")
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
         
-    train(q_func=q_func,
+    train(q_function=q_func,
           v_function=v_func, 
           policy=policy, 
           train_dataloader=train_dataloader,
           val_dataloader=val_dataloader,
-          latent_dim=model_cfg.latent_dim,
+          train_reward_mean=train_reward_mean,
+          train_reward_std=train_reward_std,
+          val_reward_mean=val_reward_mean,
+          val_reward_std=val_reward_std,
           verbose=cfg.verbose,
           wb=cfg.wb,
           checkpoint_dir=checkpoint_dir,

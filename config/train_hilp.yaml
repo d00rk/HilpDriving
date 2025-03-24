@@ -24,8 +24,8 @@ train:
     epsilon: 1e-6
     gamma: 0.99
 
-resume: false
-resume_ckpt_dir: "20250321_004526"
+resume: true
+resume_ckpt_dir: "20250321_192059"
 verbose: true
 wb: true
 wandb_project: "hilbert"

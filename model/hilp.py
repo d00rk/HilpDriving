@@ -33,7 +33,10 @@ class HilbertRepresentation(nn.Module):
         )
     
     def forward(self, state):
-        if state.dim() == 4 and state.shape[1] != 3 and state.shape[-1] == 3:
+        if isinstance(state, np.ndarray):
+            state = torch.from_numpy(state).float()
+            
+        if state.dim == 4 and state.shape[1] != 3 and state.shape[-1] == 3:
             state = state.permute(0, 3, 1, 2)   # (B, H, W, C) -> (B, C, H, W)
         features = self.feature_extractor(state)
         return features

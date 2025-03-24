@@ -33,8 +33,7 @@ def eval_hilp(model,
               device):
     pbar = tqdm.tqdm(enumerate(dataloader), total=len(dataloader), desc=f"[Validation] {epoch} / {total_epoch}", leave=True, ncols=100)
     with torch.no_grad():
-        model.eval()
-        target_model.eval()
+
         total_loss = 0.0
         for i, (state, next_state, goal, done_mask) in pbar:
             state, next_state, goal = state.to(device), next_state.to(device), goal.to(device)
@@ -73,14 +72,16 @@ def train_hilp(model,
     target_model = target_model.to(cfg.device)
     
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
-    lr_scheduler = CosineAnnealingLR(optimizer, T_max=cfg.num_epochs)
+    # lr_scheduler = CosineAnnealingLR(optimizer, T_max=cfg.num_epochs)
     
     if verbose:
         print(f"[Torch] {cfg.device} is used.")
         print(f"[Train] Start at {dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}")
     
     best_loss = np.inf
+    best_train_loss = np.inf
     global_step = 0
+    early_stop_counter = 0
     for epoch in range(cfg.num_epochs):
         total_loss = 0.0
         progress_bar = tqdm.tqdm(enumerate(train_dataloader),
@@ -120,16 +121,28 @@ def train_hilp(model,
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
             
         avg_loss = total_loss / len(train_dataloader)
-        lr_scheduler.step()
+        # lr_scheduler.step()
         
         if verbose:
             print(f"[Train] Epoch {epoch}/{cfg.num_epochs}   |   Loss: {avg_loss:.4f}")
+            
+        if avg_loss <= best_train_loss:
+            best_train_loss = avg_loss
+            early_stop_counter = 0
+        else:
+            early_stop_counter += 1
+            
+        if early_stop_counter >= 10:
+            if verbose:
+                print(f"[Train] Early stopped at epoch {epoch}")
+            break
         
         if wb:
             wandb.log({"train/epoch": epoch,
                        "train/global_step": global_step,
                        "train/loss": avg_loss,
-                       "train/lr": lr_scheduler.get_last_lr()[0]})
+                    #    "train/lr": lr_scheduler.get_last_lr()[0]
+                       })
         
          
         if epoch % cfg.eval_frequency == 0:               

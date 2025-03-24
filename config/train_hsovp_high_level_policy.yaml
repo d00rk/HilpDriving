@@ -2,23 +2,29 @@ data:
     algo: "hsovp"
     data_town: ["Town01","Town03", "Town04", "Town06"]
     num_workers: 4
-    train_batch_size: 128
-    val_batch_size: 128
+    train_batch_size: 256
+    val_batch_size: 256
     val_ratio: 0.2
     trajectory_length: 10
 
 model:
     obs_dim: 192
-    action_dim: 3
-    latent_dim: 8
+    action_dim: 2
+    latent_dim: 10
+    obs_feature_dim: 64
+    hidden_dim: 128
+    gru_hidden_dim: 64
+    gru_layers: 2
+    discrete_option: 10
     latent_as_action: true
     q_hidden_dim: 32
     v_hidden_dim: 32
-    obs_feature_dim: 64
 
 train:
     algo: "iql"
-    device: "cuda:0"
+    device: "cuda:1"
+    hsovp_dir: "20250323_090353"
+    hsovp_name: "hsovp_20250324_180658_epoch_390"
     seed: 42
     num_epochs: 1000
     eval_frequency: 10

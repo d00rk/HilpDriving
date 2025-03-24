@@ -17,15 +17,15 @@ model:
 
 train:
     algo: "iql"
-    device: "cuda:1"
+    device: "cuda:0"
     seed: 42
     num_epochs: 1000
     eval_frequency: 10
-    q_lr: 0.0001
-    v_lr: 0.0001
-    policy_lr: 0.0001
+    q_lr: 3e-4
+    v_lr: 3e-4
+    policy_lr: 3e-4
     max_steps: 10000
-    tau: 0.7
+    tau: 0.9
     beta: 0.5
     discount: 0.99
     alpha: 0.005
@@ -35,10 +35,10 @@ train:
     high: 1.0
     low: -1.0
 
-resume: true
+resume: false
 resume_ckpt_dir: "20250319_225607"
 verbose: true
 wb: true
 wandb_project: "offline_rl"
 wandb_name: "train_iql"
-wandb_tag: ["leaderboard1", "Town01", "Town03", "Town04", "Town06", "iql", "baseline"]
+wandb_tag: ["Town01", "Town03", "Town04", "Town06", "iql", "baseline"]

@@ -22,7 +22,7 @@ from model.hilp import HilbertRepresentation
 from model.value_function import TwinQ, ValueFunction
 from model.policy import GaussianPolicy
 from dataset.dataset import LatentDataset
-from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp
+from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp, get_reward_statics
 from utils.seed_utils import seed_all
 
 EXP_ADV_MAX = 100.
@@ -30,7 +30,9 @@ EXP_ADV_MAX = 100.
 def eval(q_function,
          target_q_function,
          v_function,
-         policy, 
+         policy,
+         reward_mean,
+         reward_std,
          dataloader,
          epoch,
          cfg):
@@ -43,6 +45,8 @@ def eval(q_function,
         total_policy_loss = 0.0
         for i, (states, zs, next_states, rewards, terminals, _) in pbar:
             states, zs, next_states, rewards, terminals = states.to(cfg.device), zs.to(cfg.device), next_states.to(cfg.device), rewards.to(cfg.device), terminals.to(cfg.device)
+            normalized_rewards = (rewards - reward_mean) / (reward_std + 1e-6)
+            
             if cfg.algo == "iql":
                 q_target = target_q_function(states, zs)
                 next_v = v_function(next_states)
@@ -50,7 +54,7 @@ def eval(q_function,
                 adv = q_target - v
                 v_loss = asymmetric_l2_loss(adv, cfg.tau)
                 
-                targets = rewards + (1.0 - terminals) * cfg.discount * next_v.detach()
+                targets = normalized_rewards + (1.0 - terminals.float()) * cfg.discount * next_v.detach()
                 q1, q2 = q_function.both(states, zs)
                 q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
                 
@@ -70,7 +74,7 @@ def eval(q_function,
                 z_next_mu, z_next_logstd = policy(next_states)
                 z_next_pred = torch.distributions.Normal(z_next_mu, z_next_logstd.exp()).rsample()
                 q_next_target = target_q_function(next_states, z_next_pred)
-                target_q = rewards + (1.0 - terminals) * cfg.discount * q_next_target
+                target_q = normalized_rewards + (1.0 - terminals) * cfg.discount * q_next_target
                 
                 q1, q2 = q_function.both(states, zs)
                 q_loss = sum(F.mse_loss(q, target_q) for q in [q1, q2]) / 2
@@ -123,7 +127,10 @@ def train(q_function,
           policy, 
           train_dataloader, 
           val_dataloader,  
-          latent_dim,
+          train_reward_mean,
+          train_reward_std,
+          val_reward_mean,
+          val_reward_std,
           verbose,
           wb,
           checkpoint_dir,
@@ -133,9 +140,9 @@ def train(q_function,
     policy = policy.to(cfg.device)
     target_q_function = copy.deepcopy(q_function).requires_grad_(False).to(cfg.device)
     
-    q_optimizer = torch.optim.Adam(q_function.parameters(), lr=cfg.q_lr)
-    policy_optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.policy_lr)
-    v_optimizer = torch.optim.Adam(v_function.parameters(), lr=cfg.v_lr) if v_function is not None else None
+    q_optimizer = torch.optim.AdamW(q_function.parameters(), lr=cfg.q_lr)
+    policy_optimizer = torch.optim.AdamW(policy.parameters(), lr=cfg.policy_lr)
+    v_optimizer = torch.optim.AdamW(v_function.parameters(), lr=cfg.v_lr) if v_function is not None else None
     policy_lr_scheduler = CosineAnnealingLR(policy_optimizer, cfg.max_steps)
     
     if verbose:
@@ -157,6 +164,7 @@ def train(q_function,
         
         for i, (state, z, next_state, reward, terminal, _) in progress_bar:
             state, z, next_state, reward, terminal = state.to(cfg.device), z.to(cfg.device), next_state.to(cfg.device), reward.to(cfg.device), terminal.to(cfg.device)
+            normalized_reward = (reward - train_reward_mean) / (train_reward_std + 1e-6)
             if cfg.algo == "iql":
                 with torch.no_grad():
                    q_target = target_q_function(state, z)
@@ -168,7 +176,7 @@ def train(q_function,
                 v_loss.backward()
                 v_optimizer.step()
                 
-                targets = reward + (1.0 - terminal) * cfg.discount * next_v.detach()
+                targets = normalized_reward + (1.0 - terminal.float()) * cfg.discount * next_v.detach()
                 q1, q2 = q_function.both(state, z)
                 q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
                 q_optimizer.zero_grad(set_to_none=True)
@@ -198,7 +206,7 @@ def train(q_function,
                     z_next_mu, z_next_logstd = policy(next_state)
                     z_next_pred = torch.distributions.Normal(z_next_mu, z_next_logstd.exp()).rsample()
                     q_next_target = target_q_function(next_state, z_next_pred)
-                    target_q = reward + (1.0 - terminal) * cfg.discount * q_next_target
+                    target_q = normalized_reward + (1.0 - terminal) * cfg.discount * q_next_target
                 
                 q1, q2 = q_function.both(state, z)
                 q_loss = sum(F.mse_loss(q, target_q) for q in [q1, q2]) / 2
@@ -278,8 +286,9 @@ def train(q_function,
                                   target_q_function=target_q_function,
                                   v_function=v_function,
                                   policy=policy,
+                                  reward_mean=val_reward_mean,
+                                  reward_std=val_reward_std,
                                   dataloader=val_dataloader, 
-                                  latent_dim=latent_dim,
                                   epoch=epoch,
                                   cfg=cfg)
             
@@ -288,7 +297,7 @@ def train(q_function,
             if wb:
                 wandb.log(eval_loss_dict)
                 
-            if eval_loss_dict['eval/loss'] <= best_loss:
+            if eval_loss_dict['eval/policy_loss'] <= best_loss:
                 if verbose:
                     print(f"Save best model of epoch {epoch}")
                 
@@ -318,13 +327,13 @@ def train(q_function,
 
 
 @click.command()
-@click.option("-c", "--config", type=str, default='train_hilbert_polilcy', required=True, help="config file name")
+@click.option("-c", "--config", type=str, default='train_high_level_policy', required=True, help="config file name")
 def main(config):
-    CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.getcwd())), f'config/{config}.yaml')
+    CONFIG_FILE = os.path.join(os.getcwd(), f'config/{config}.yaml')
     cfg = OmegaConf.load(CONFIG_FILE)
     
     if cfg.resume:
-        resume_conf = OmegaConf.load(os.path.dirname(os.path.dirname(os.getcwd())), f'outputs/hilbert_policy/{cfg.resume_ckpt_dir}/{config}.yaml'))
+        resume_conf = OmegaConf.load(os.path.join(os.getcwd(), f'outputs/hilbert_policy/{cfg.resume_ckpt_dir}/{config}.yaml'))
         cfg.data = resume_conf.data
         cfg.model = resume_conf.model
         cfg.train = resume_conf.train
@@ -337,7 +346,7 @@ def main(config):
     seed_all(train_cfg.seed)
 
     # pretrained hilbert representation model
-    HILP_DICT_PATH = os.path.join(os.getcwd()), f'outputs/hilp/{train_cfg.hilp_dir}/{train_cfg.hilp_dict_name}.pt')
+    HILP_DICT_PATH = os.path.join(os.getcwd(), f'outputs/hilp/{train_cfg.hilp_dir}/{train_cfg.hilp_dict_name}.pt')
     hilbert_representation = HilbertRepresentation(model_cfg)
     ckpt = torch.load(HILP_DICT_PATH)
     hilbert_representation.load_state_dict(ckpt['hilbert_representation_state_dict'])
@@ -347,10 +356,13 @@ def main(config):
     if cfg.verbose:
         print("Create HILP dataset")
         
-    dataset = LatentDataset(train_cfg.seed, train_cfg.gamma, hilbert_representation, data_cfg)
-    train_dataset, val_dataset = dataset.split_tran_val()
-    train_dataloader = DataLoader(train_dataset, batch_size=train_cfg.train_batch_size, shuffle=True, num_workers=train_cfg.num_workers)
-    val_dataloader = DataLoader(val_dataset, batch_size=train_cfg.val_batch_size, shuffle=True, num_workers=train_cfg.num_workers)
+    dataset = LatentDataset(train_cfg.seed, train_cfg.discount, hilbert_representation, data_cfg)
+    train_dataset, val_dataset = dataset.split_train_val()
+    train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
+    
+    train_reward_mean, train_reward_std = get_reward_statics(train_dataloader)
+    val_reward_mean, val_reward_std = get_reward_statics(val_dataloader)
     
     if cfg.verbose:
         print("Created Dataset, DataLoader.")
@@ -366,7 +378,8 @@ def main(config):
         ckpt = torch.load(ckpts[-1])
         q_func.load_state_dict(ckpt['q_state_dict'])
         policy.load_state_dict(ckpt['policy_state_dict'])
-    
+        if cfg.verbose:
+            print(f"Resumed from {ckpts[-1]}")
     if train_cfg.algo == "iql":
         v_func = ValueFunction(model_cfg)
         v_func.initialize()
@@ -381,7 +394,7 @@ def main(config):
         wandb.run.tags = cfg.wandb_tag
         wandb.run.name = f"{cfg.wandb_name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-    checkpoint_dir = os.path.join(os.path.dirname(os.path.dirname(os.getcwd())), f'outputs/hilbert_high_level_policy/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}')
+    checkpoint_dir = os.path.join(os.getcwd(), f"outputs/hilbert_high_level_policy/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     if cfg.verbose:
         print(f"Created output directory: {checkpoint_dir}.")
@@ -392,7 +405,10 @@ def main(config):
           policy=policy, 
           train_dataloader=train_dataloader,
           val_dataloader=val_dataloader,
-          latent_dim=model_cfg.latent_dim,
+          train_reward_mean=train_reward_mean,
+          train_reward_std=train_reward_std,
+          val_reward_mean=val_reward_mean,
+          val_reward_std=val_reward_std,
           verbose=cfg.verbose,
           wb=cfg.wb,
           checkpoint_dir=checkpoint_dir,

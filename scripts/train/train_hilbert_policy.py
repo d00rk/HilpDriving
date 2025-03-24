@@ -21,7 +21,7 @@ from omegaconf import OmegaConf
 from model.hilp import HilbertRepresentation
 from model.value_function import TwinQforHilbert, ValueFunctionforHilbert
 from model.policy import GaussianPolicyforHilbert
-from dataset.dataset import SubTrajectoryDataset
+from dataset.dataset import SubTrajDataset
 from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp
 from utils.seed_utils import seed_all
 from utils.sampler import sample_latent_vectors
@@ -50,7 +50,7 @@ def eval(model,
             batch_size, seq_len, _ = actions.shape
             z = sample_latent_vectors(batch_size=batch_size, latent_dim=latent_dim)
             z_expand = z.unsqueeze(1).expand(batch_size, seq_len, latent_dim).contiguous().view(batch_size*seq_len, latent_dim)
-            
+            z_expand = z_expand.to(cfg.device)
             states = states.view(batch_size * seq_len, a, b, c)
             actions = actions.view(batch_size * seq_len, -1)
             next_states = next_states.view(batch_size * seq_len, a, b, c)
@@ -187,7 +187,8 @@ def train(model,
             batch_size, seq_len, _ = action.shape
             
             z = sample_latent_vectors(batch_size=batch_size, latent_dim=latent_dim)
-            z_expand = z.unsqueeze(1).expand(batch_size, seq_len, latent_dim).contiguous().view(batch_size*seq_len, latent_dim)      
+            z_expand = z.unsqueeze(1).expand(batch_size, seq_len, latent_dim).contiguous().view(batch_size*seq_len, latent_dim)
+            z_expand = z_expand.to(cfg.device)
             
             state = state.view(batch_size * seq_len, a, b, c)
             action = action.view(batch_size * seq_len, -1)
@@ -214,7 +215,7 @@ def train(model,
                 v_optimizer.step()
                 
                 targets = intrinsic_reward + (1.0 - terminal) * cfg.discount * next_v.detach()
-                q1, q2 = q_function.both(state, z,action)
+                q1, q2 = q_function.both(state, z_expand, action)
                 q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
                 q_optimizer.zero_grad(set_to_none=True)
                 q_loss.backward()
@@ -223,7 +224,7 @@ def train(model,
                 update_exponential_moving_average(target_q_function, q_function, cfg.alpha)
                 
                 exp_adv = torch.exp(cfg.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
-                a_mu, a_logstd = policy(state, z)
+                a_mu, a_logstd = policy(state, z_expand)
                 a_pred = torch.distributions.Normal(a_mu, a_logstd.exp()).rsample()
                 bc_losses = torch.sum((a_pred - action)**2, dim=1)
                 policy_loss = torch.mean(exp_adv * bc_losses)
@@ -364,13 +365,13 @@ def train(model,
 
 
 @click.command()
-@click.option("-c", "--config", type=str, default='train_hilbert_polilcy', required=True, help="config file name")
+@click.option("-c", "--config", type=str, default='train_hilbert_policy', required=True, help="config file name")
 def main(config):
-    CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.getcwd())), f'config/{config}.yaml')
+    CONFIG_FILE = os.path.join(os.getcwd(), f'config/{config}.yaml')
     cfg = OmegaConf.load(CONFIG_FILE)
     
     if cfg.resume:
-        resume_conf = OmegaConf.load(os.path.dirname(os.path.dirname(os.getcwd())), f"outputs/hilbert_policy/{cfg.resume_ckpt_dir}/{config}.yaml")
+        resume_conf = OmegaConf.load(os.path.join(os.getcwd(), f"outputs/hilbert_policy/{cfg.resume_ckpt_dir}/{config}.yaml"))
         cfg.data = resume_conf.data
         cfg.model = resume_conf.model
         cfg.train = resume_conf.train
@@ -382,7 +383,7 @@ def main(config):
     seed_all(train_cfg.seed)
 
     # pretrained hilbert representation model
-    HILP_DICT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.getcwd())), f"/outputs/hilp/{train_cfg.hilp_dir}/{train_cfg.hilp_dict_name}.pt")
+    HILP_DICT_PATH = os.path.join(os.getcwd(), f"outputs/hilp/{train_cfg.hilp_dir}/{train_cfg.hilp_dict_name}.pt")
     hilbert_representation = HilbertRepresentation(model_cfg)
     ckpt = torch.load(HILP_DICT_PATH)
     hilbert_representation.load_state_dict(ckpt['hilbert_representation_state_dict'])
@@ -391,10 +392,10 @@ def main(config):
     if cfg.verbose:
         print("Create trajectory dataset")
         
-    dataset = SubTrajectoryDataset(train_cfg.seed, data_cfg)
-    train_dataset, val_dataset = dataset.split_tran_val()
-    train_dataloader = DataLoader(train_dataset, batch_size=train_cfg.train_batch_size, shuffle=True, num_workers=train_cfg.num_workers)
-    val_dataloader = DataLoader(val_dataset, batch_size=train_cfg.val_batch_size, shuffle=True, num_workers=train_cfg.num_workers)
+    dataset = SubTrajDataset(train_cfg.seed, data_cfg)
+    train_dataset, val_dataset = dataset.split_train_val()
+    train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
     
     if cfg.verbose:
         print("Created Dataset, DataLoader.")
@@ -403,7 +404,7 @@ def main(config):
     policy = GaussianPolicyforHilbert(model_cfg)
     
     if cfg.resume:
-        ckpts = sorted(glob.glob(os.path.join(os.path.dirname(os.path.dirname(os.getcwd())), f"outputs/hilbert_policy/{cfg.resume_ckpt_dir}/hilbert_policy_{train_cfg.algo}_*.pt")))
+        ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"outputs/hilbert_policy/{cfg.resume_ckpt_dir}/hilbert_policy_{train_cfg.algo}_*.pt")))
         ckpt = torch.load(ckpts[-1])
         q_func.load_state_dict(ckpt['q_state_dict'])
         policy.load_state_dict(ckpt['policy_state_dict'])
@@ -421,7 +422,7 @@ def main(config):
         wandb.run.tags = cfg.wandb_tag
         wandb.run.name = f"{cfg.wandb_name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-    checkpoint_dir = os.path.join(os.path.dirname(os.path.dirname(os.getcwd())), f'outputs/hilbert_policy/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}')
+    checkpoint_dir = os.path.join(os.getcwd(), f"outputs/hilbert_policy/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     if cfg.verbose:
         print(f"Created output directory: {checkpoint_dir}.")

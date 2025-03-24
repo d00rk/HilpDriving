@@ -166,24 +166,23 @@ class LatentDataset(Dataset):
         
         self.index_list = list()
         hdf5_paths = []
-        for t in self.town:
-            hp = glob.glob(os.path.join(os.path.dirname(os.getcwd()), f'data/{t.lower()}_*.hdf5'))
+        for t in cfg.data_town:
+            hp = glob.glob(os.path.join(os.getcwd(), f'data/{t.lower()}_*.hdf5'))
             hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
         
         for hdf5_path in hdf5_paths:
             with h5py.File(hdf5_path, 'r') as f:
-                step_keys = sorted([k for k in f.keys() if k.startswith("step_")], 
-                                   key=lambda x: int(x.split("_")[1]))
+                step_keys = sorted(
+                    [k for k in f.keys() if k.startswith("step_")],
+                    key=lambda x: int(x.split("_")[1])
+                )
                 epi_length = len(step_keys)
-                
-                for i in range(epi_length):
-                    if i in range(epi_length - cfg.length + 1, epi_length):
-                        next_idx = epi_length - 1
-                        terminal = True
-                    else:
-                        next_idx = i + cfg.length - 1
-                        terminal = False
+                # i는 0부터 (epi_length - trajectory_length)까지 순회합니다.
+                for i in range(epi_length - cfg.trajectory_length + 1):
+                    next_idx = i + cfg.trajectory_length - 1
+                    # trajectory가 episode의 마지막 step을 포함하면 terminal=True
+                    terminal = (next_idx == epi_length - 1)
                     current_step_key = step_keys[i]
                     next_step_key = step_keys[next_idx]
                     self.index_list.append((hdf5_path, current_step_key, next_step_key, terminal, i, next_idx, step_keys))
@@ -194,49 +193,46 @@ class LatentDataset(Dataset):
     def __getitem__(self, index):
         file_path, current_key, end_key, terminal, start_idx, end_idx, step_keys = self.index_list[index]
         with h5py.File(file_path, 'r') as f:
-            current_obs = f[current_key]['obs']['birdview']['rendered'][:]
-            next_obs = f[end_key]['obs']['birdview']['rendered'][:]
+            current_obs = f[current_key]['obs']['birdview']['rendered'][:].astype(np.float32)
+            next_obs = f[end_key]['obs']['birdview']['rendered'][:].astype(np.float32)
             
             if self.algo == "hilp":
                 with torch.no_grad():
-                    z = self.encoder(current_obs)
-                    z_next = self.encoder(next_obs)
+                    current_obs_tensor = torch.tensor(current_obs, dtype=torch.float32).permute(2, 0, 1)
+                    next_obs_tensor = torch.tensor(next_obs, dtype=torch.float32).permute(2, 0, 1)
+
+                    z = self.encoder(current_obs_tensor.unsqueeze(0))
+                    z_next = self.encoder(next_obs_tensor.unsqueeze(0))
                     vec = z_next - z
-                    norm = np.linalg.norm(vec)
+                    norm = torch.norm(vec)
                     z = vec / (norm + 1e-6)
+                    z = z.squeeze(0)
             else:
                 with torch.no_grad():
                     traj = []
                     for j in range(start_idx, end_idx):
+                        # print(f"start: {start_idx}, end: {end_idx}, j: {j}")
                         s = f[step_keys[j]]['obs']['birdview']['rendered'][:]
                         a = f[step_keys[j]]['supervision']['action'][:]
-                        s_next = f[step_keys[min(j+1, end_idx)]]['obs']['birdview']['rendered'][:]
+                        s_next = f[step_keys[j+1]]['obs']['birdview']['rendered'][:]
                         r = f[step_keys[j]]['reward'][()]
-                        terminal = f[step_keys[j]]['terminal'][()]
+                        terminal = (j == end_idx - 1)
                         traj.append([s, a, s_next, r, terminal, False])
                     s, a, s_n, r, terminal, timeout = zip(*traj)
-                    s = torch.tensor(np.array(s).transpose(0, 3, 1, 2), 
-                            dtype=torch.float32).contiguous().clone()
-                    a = torch.tensor(np.array(a), 
-                             dtype=torch.float32).contiguous().clone()
-                    s_n = torch.tensor(np.array(s_n).transpose(0, 3, 1, 2), 
-                                 dtype=torch.float32).contiguous().clone()
-                    r = torch.tensor(np.array(r), 
-                             dtype=torch.float32).unsqueeze(1).contiguous().clone()
-                    terminal = torch.tensor(np.array(terminal), 
-                               dtype=torch.float32).unsqueeze(1).contiguous().clone()
-                    timeout = torch.tensor(np.array(timeout), 
-                              dtype=torch.float32).unsqueeze(1).contiguous().clone()
-                    subtraj = (s, a, s_n, r, terminal, timeout)
+                    s = torch.tensor(np.array(s).transpose(0, 3, 1, 2), dtype=torch.float32).contiguous().clone().unsqueeze(0)
+                    a = torch.tensor(np.array(a), dtype=torch.float32).contiguous().clone().unsqueeze(0)
+                    z = self.encoder(s, a)
+                    current_obs_tensor = s
+                    next_obs_tensor = torch.tensor(np.array(s_n), dtype=torch.float32).permute(0, 3, 1, 2)
 
-                    z = self.encoder(subtraj)
                 
             R = 0.0
             for j in range(start_idx, end_idx):
-                r_j = f[step_keys[j]]['reward'][()]
+                r_j = np.float32(f[step_keys[j]]['reward'][()])
                 R += (self.gamma ** (j-start_idx)) * r_j
-        
-        return (current_obs, z, next_obs, R, terminal, False)
+
+        # print(f"current_obs: {current_obs.shape}, z: {z}, next_obs: {next_obs.shape}, R: {R}, terminal: {terminal}")
+        return (current_obs_tensor, z, next_obs_tensor, torch.tensor(R, dtype=torch.float32), torch.tensor(terminal, dtype=torch.float32), torch.tensor(False, dtype=torch.float32))
          
     
     def split_train_val(self):

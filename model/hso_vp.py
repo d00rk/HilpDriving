@@ -109,15 +109,22 @@ class Decoder(nn.Module):
         
         
     def forward(self, state, z):
-        if state.dim() == 4 and state.shape[1] != 3 and state.shape[-1] == 3:
-            state = state.permute(0, 3, 1, 2)
-        batch_size, c, h, w = state.shape
+        if state.dim() == 5 and state.shape[2] != 3 and state.shape[-1] == 3:
+            state = state.permute(0, 1, 4, 2, 3)
+        batch_size, seq_len, c, h, w = state.shape
+        state = state.view(batch_size * seq_len, c, h, w)
         state_features = self.feature_extractor(state)
+        state_features = state_features.view(batch_size, seq_len, -1)
         state_features = torch.nan_to_num(state_features, nan=0.0, posinf=1.0, neginf=-1.0)
-
-        gru_input = torch.cat([state_features, z], dim=-1)
+        
+        torch.cuda.empty_cache()
+        
+        z_expand = z.unsqueeze(1).expand(-1, seq_len, -1)
+        
+        gru_input = torch.cat([state_features, z_expand], dim=-1)
         gru_output, _ = self.gru(gru_input)
         gru_output = torch.nan_to_num(gru_output, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         action = self.decoder(gru_output)
         action = torch.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
         return action

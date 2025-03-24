@@ -49,16 +49,16 @@ def eval(encoder,
            
             z_mu, z_std, logits, discrete_y = encoder(states, actions)
             z = Normal(z_mu, z_std).rsample()
-            action_pred = decoder(states[:, 0, :, :, :], z)
+            action_pred = decoder(states, z)
             prior_mu, prior_std, prior_logits, prior_discrete_y = prior(states[:, 0, :, :, :])
                 
-            recon_loss = F.mse_loss(action_pred, actions[:, 0, :])
+            recon_loss = F.mse_loss(action_pred, actions)
             
             q = F.softmax(logits, dim=-1)
             p = F.softmax(prior_logits, dim=-1)
                              
             kl_y = (q * (torch.log(q + 1e-8) - torch.log(p + 1e-8))).sum(dim=-1).mean()
-            kl_z = ((torch.log(z_std + 1e-8) - torch.log(prior_std + 1e-8)) + (prior_std.pow(2) + (z_mu - prior_mu).pow(2)) / (2 * z_std.pow(2)) - 0.5).sum(dim=-1).mean()
+            kl_z = ((torch.log(prior_std + 1e-8) - torch.log(z_std + 1e-8)) + (z_std.pow(2) + (z_mu - prior_mu).pow(2)) / (2 * prior_std.pow(2)) - 0.5).sum(dim=-1).mean()
                 
             loss = recon_loss + beta_y * kl_y + beta_z * kl_z
                 
@@ -90,7 +90,6 @@ def train(encoder,
     encoder = encoder.to(cfg.device)
     decoder = decoder.to(cfg.device)
     prior = prior.to(cfg.device)
-    
     if verbose:
         print(f"[Torch] {cfg.device} is used.")
         print(f"[Train] Start at {dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
@@ -115,10 +114,10 @@ def train(encoder,
             z_mu, z_std, z_logits, discrete_y = encoder(states, actions)
             z = Normal(z_mu, z_std).rsample()
             
-            action_pred = decoder(states[:, 0, :, :, :], z)
+            action_pred = decoder(states, z)
             prior_mu, prior_std, prior_logits, prior_discrete_y = prior(states[:, 0, :, :, :])
 
-            recon_loss = F.mse_loss(action_pred, actions[:, 0, :])
+            recon_loss = F.mse_loss(action_pred, actions)
             
             q = F.softmax(z_logits, dim=-1)
             p = F.softmax(prior_logits, dim=-1)
@@ -238,6 +237,8 @@ def main(config):
         encoder.load_state_dict(ckpt['encoder_state_dict'])
         decoder.load_state_dict(ckpt['decoder_state_dict'])
         prior.load_state_dict(ckpt['prior_state_dict'])
+        if cfg.verbose:
+            print(f"Resume from {ckpts[-1]}")
         
     if cfg.wb:
         wandb.init(project=cfg.wandb_project, config=OmegaConf.to_container(cfg, resolve=True))
