@@ -1,9 +1,10 @@
 data:
-    data_town: ["Town01", "Town03", "Town04", "Town06"]
+    data_town: ["Town01", "Town02", "Town03", "Town04", "Town05", "Town06", "Town10"]
+    type: ["long", "short"]
     p: 0.2
     num_workers: 4
-    train_batch_size: 256
-    val_batch_size: 256
+    train_batch_size: 512
+    val_batch_size: 512
     val_ratio: 0.2
     length: 10
 
@@ -18,14 +19,16 @@ train:
     seed: 42
     num_epochs: 1000
     eval_frequency: 10
+    target_update_frequency: 5
     lr: 0.001
     tau: 0.05
     expectile_tau: 0.7
     epsilon: 1e-6
     gamma: 0.99
+    patience: 20
 
-resume: true
-resume_ckpt_dir: "20250321_192059"
+resume: false
+resume_ckpt_dir: null
 verbose: true
 wb: true
 wandb_project: "hilbert"

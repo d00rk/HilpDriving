@@ -17,11 +17,13 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import torch.backends.cudnn as cudnn
 
 from model.hilp import HilbertRepresentation
 from dataset.dataset import GoalDataset
 from utils.seed_utils import seed_all
 from utils.utils import l2_expectile_loss
+
 
 def eval_hilp(model, 
               target_model, 
@@ -31,30 +33,32 @@ def eval_hilp(model,
               gamma,
               expectile_tau,
               device):
+    model.eval()
+    target_model.eval()
+    
+    total_loss = 0.0
     pbar = tqdm.tqdm(enumerate(dataloader), total=len(dataloader), desc=f"[Validation] {epoch} / {total_epoch}", leave=True, ncols=100)
-    with torch.no_grad():
-
-        total_loss = 0.0
-        for i, (state, next_state, goal, done_mask) in pbar:
-            state, next_state, goal = state.to(device), next_state.to(device), goal.to(device)
-            
+    with torch.inference_mode(), torch.cuda.amp.autocast():
+        for i, (state, next_state, goal, is_goal_now) in pbar:
+            state = state.to(device, non_blocking=True)
+            next_state = next_state.to(device, non_blocking=True)
+            goal = goal.to(device, non_blocking=True)
+            is_goal_now = is_goal_now.to(device, non_blocking=True).float()
+        
             phi_s = model(state)
             phi_g = model(goal) 
-            phi_next_s = target_model(next_state).detach()
-            phi_next_g = target_model(goal).detach()
-                        
-            temporal_dist = torch.norm(phi_s - phi_g, dim=-1)       # (256)
+            phi_next_s = target_model(next_state)
+            phi_next_g = target_model(goal)
             
-            reward = -1.0 * (~done_mask).float().to(device)
-            # gamma_mask = (~done_mask).float().to(cfg.device)
             
+            temporal_dist = torch.norm(phi_s - phi_g, dim=-1)       # (B, )
+            reward = -1.0 * (1.0 - is_goal_now)
             target_dist = gamma * torch.norm(phi_next_s - phi_next_g, dim=-1)
-            delta = reward + target_dist + temporal_dist
+            delta = reward - target_dist + temporal_dist
 
             loss = l2_expectile_loss(delta, expectile_tau)
-
             total_loss += loss.item()
-            
+        
         avg_loss = total_loss / len(dataloader)
     return avg_loss
 
@@ -62,7 +66,8 @@ def eval_hilp(model,
 def train_hilp(model, 
                target_model, 
                train_dataloader, 
-               val_dataloader, 
+               val_dataloader,
+               scaler,
                verbose,
                wb,
                checkpoint_dir,
@@ -88,40 +93,51 @@ def train_hilp(model,
                                  total=len(train_dataloader), 
                                 desc=f"[Train] Epoch {epoch}/{cfg.num_epochs}", 
                                 leave=True, ncols=100)
+        model.train()
         
-        for i, (state, next_state, goal, done_mask) in progress_bar:
-            state, next_state, goal = state.to(cfg.device), next_state.to(cfg.device), goal.to(cfg.device)
-            
-            # phi(s), phi(g)
-            phi_s = model(state)        # (256, 10)
-            phi_g = model(goal)         # (256, 10)
-            # target_phi(s'), target_phi(g) 
-            target_phi_next_s = target_model(next_state).detach() # (256, 10)
-            target_phi_g = target_model(goal).detach()           # (256, 10)
-                
-            temporal_dist = torch.norm(phi_s - phi_g, dim=-1)       # (256)
-            
-            reward = -1.0 * (~done_mask).float().to(cfg.device)
-            # gamma_mask = (~done_mask).float().to(cfg.device)
-            
-            target_dist = cfg.gamma * torch.norm(target_phi_next_s - target_phi_g, dim=-1)
-            delta = reward + target_dist + temporal_dist
-
-            loss = l2_expectile_loss(delta, cfg.expectile_tau)
+        for i, (state, next_state, goal, is_goal_now) in progress_bar:
+            state = state.to(cfg.device, non_blocking=True)
+            next_state = next_state.to(cfg.device, non_blocking=True)
+            goal =  goal.to(cfg.device, non_blocking=True)
+            is_goal_now = is_goal_now.to(cfg.device, non_blocking=True).float()
             
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            with torch.no_grad():
-                for param, target_param in zip(model.parameters(), target_model.parameters()):
-                    target_param.data.copy_(cfg.tau * param.data + (1 - cfg.tau) * target_param.data)
+            
+            with torch.cuda.amp.autocast():
+                # phi(s), phi(g)
+                phi_s = model(state)        # (B, 10)
+                phi_g = model(goal)         # (B, 10)
+                
+                with torch.inference_mode():
+                    # target_phi(s'), target_phi(g) 
+                    target_phi_next_s = target_model(next_state)         # (B, 10)
+                    target_phi_g = target_model(goal)                    # (B, 10)
+                
+                temporal_dist = torch.norm(phi_s - phi_g, dim=-1)       # (B, )
+                
+                reward = -1.0 * (1.0 - is_goal_now)
+                
+                target_dist = cfg.gamma * torch.norm(target_phi_next_s - target_phi_g, dim=-1)
+                delta = reward - target_dist + temporal_dist
+                
+                loss = l2_expectile_loss(delta, cfg.expectile_tau)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            if (i % cfg.target_update_frequency) == 0:
+                with torch.no_grad():
+                    tau = cfg.tau
+                    for param, target_param in zip(model.parameters(), target_model.parameters()):
+                        target_param.data.mul_(1 - tau).add_(param.data, alpha=tau)
+            
             
             total_loss += loss.item()
             global_step += 1
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
             
         avg_loss = total_loss / len(train_dataloader)
-        # lr_scheduler.step()
         
         if verbose:
             print(f"[Train] Epoch {epoch}/{cfg.num_epochs}   |   Loss: {avg_loss:.4f}")
@@ -132,7 +148,7 @@ def train_hilp(model,
         else:
             early_stop_counter += 1
             
-        if early_stop_counter >= 10:
+        if early_stop_counter >= cfg.patience:
             if verbose:
                 print(f"[Train] Early stopped at epoch {epoch}")
             break
@@ -145,7 +161,7 @@ def train_hilp(model,
                        })
         
          
-        if epoch % cfg.eval_frequency == 0:               
+        if epoch % cfg.eval_frequency == 0:
             eval_loss = eval_hilp(model=model, 
                                   target_model=target_model, 
                                   dataloader=val_dataloader, 
@@ -198,9 +214,20 @@ def main(config):
         
     seed_all(train_cfg.seed)
     
+    cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision('high')
+    
     model = HilbertRepresentation(model_cfg)
     target_model = HilbertRepresentation(model_cfg)
     target_model.load_state_dict(model.state_dict())
+    
+    for p in target_model.parameters():
+        p.requires_grad_(False)
+    
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    
     if cfg.resume:
         ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"outputs/hilp/{cfg.resume_ckpt_dir}/hilbert_representation_*.pt")))
         ckpt = torch.load(ckpts[-1])
@@ -214,8 +241,11 @@ def main(config):
         
     dataset = GoalDataset(train_cfg.seed, data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
-    train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
-    val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=True, num_workers=data_cfg.num_workers)
+    
+    train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers,
+                                  pin_memory=False, persistent_workers=True, prefetch_factor=4)
+    val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=False, num_workers=data_cfg.num_workers,
+                                pin_memory=True, persistent_workers=True, prefetch_factor=2)
     
     if cfg.verbose:
         print("Created Dataset, DataLoader.")
@@ -226,7 +256,7 @@ def main(config):
         wandb.run.tags = cfg.wandb_tag
         wandb.run.name = f"{cfg.wandb_name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    checkpoint_dir = os.path.join(os.getcwd(), f"outputs/hilp/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    checkpoint_dir = os.path.join(os.getcwd(), f"data/outputs/hilp/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
     
@@ -236,12 +266,13 @@ def main(config):
     train_hilp(model=model, 
                target_model=target_model, 
                train_dataloader=train_dataloader, 
-               val_dataloader=val_dataloader, 
+               val_dataloader=val_dataloader,
+               scaler=scaler,
                verbose=cfg.verbose, 
                wb=cfg.wb,
                checkpoint_dir=checkpoint_dir,
                cfg=train_cfg)
-    
+
 
 if __name__=="__main__":
     main()

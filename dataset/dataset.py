@@ -140,8 +140,11 @@ class GoalDataset(Dataset):
             goal_obs =d['birdview'][goal_key]
             
         current_obs_tensor = torch.tensor(current_obs, dtype=torch.float32)
+        current_obs_tensor = current_obs_tensor.permute(2, 0, 1).contiguous()
         next_obs_tensor = torch.tensor(next_obs, dtype=torch.float32)
+        next_obs_tensor = next_obs_tensor.permute(2, 0, 1).contiguous()
         goal_obs_tensor = torch.tensor(goal_obs, dtype=torch.float32)
+        goal_obs_tensor = goal_obs_tensor.permute(2, 0, 1).contiguous()
         
         return (current_obs_tensor, next_obs_tensor, goal_obs_tensor, is_goal_now)
     

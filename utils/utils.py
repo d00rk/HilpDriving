@@ -15,7 +15,8 @@ def asymmetric_l2_loss(u, tau):
     return torch.mean(torch.abs(tau - (u < 0).float()) * u**2)
 
 def l2_expectile_loss(x, tau):
-    return torch.mean(torch.abs(tau - (x < 0).float() * (x ** 2)))
+    weight = torch.where(x < 0, 1.0-float(tau), float(tau))
+    return torch.mean(weight * (x ** 2))
 
 def update_exponential_moving_average(target, source, alpha):
     with torch.no_grad():
