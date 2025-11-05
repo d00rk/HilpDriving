@@ -4,3 +4,5 @@ data
 outputs
 wandb
 tmp
+*/__pycache__
+nohup*

@@ -90,25 +90,26 @@ class GoalDataset(Dataset):
         self.index_list = list()
         
         hdf5_paths = list()
-        for t in cfg.data_town:
-            hp = glob.glob(os.path.join(os.getcwd(), f'data/{t.lower()}_*.hdf5'))
-            hdf5_paths.extend(hp)
+        for town in cfg.data_town:
+            for t in cfg.type:
+                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town.lower()}_{t.lower()}.hdf5'))
+                hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
         
         for hdf5_path in hdf5_paths:
             with h5py.File(hdf5_path, 'r') as f:
-                step_keys = sorted([k for k in f.keys() if k.startswith("step_")], 
+                epi_keys = sorted([k for k in f.keys() if k.startswith("episode_")], 
                                    key=lambda x: int(x.split("_")[1]))
-                epi_length = len(step_keys)
-                for i in range(epi_length):
-                    current_step_key = step_keys[i]
-                    if i == (epi_length - 1):
-                        next_step_key = step_keys[i]
-                        goal_step_key = step_keys[i]
-                    else:
+                for epi in epi_keys:
+                    data = f[epi]
+                    epi_length = data.attrs['episode_length']
+                    for i in range(epi_length-1):
+                        current_step_key = i
+                        next_step_key = i+1
+                        
                         step = 1
                         max_future_step = (epi_length - 1) - i
-                        next_step_key = step_keys[min(i+1, epi_length-1)]
+                        
                         while True:
                             if random.random() < self.p:
                                 break
@@ -116,26 +117,33 @@ class GoalDataset(Dataset):
                             if step >= max_future_step:
                                 step = max_future_step
                                 break
-                        goal_step_key = step_keys[min(i+step, epi_length-1)]
-                    done_mask = (current_step_key == next_step_key)
-                    self.index_list.append((hdf5_path, current_step_key, next_step_key, goal_step_key, done_mask))
-                            
+                        
+                        goal_step_key = i+step
+                        assert goal_step_key != current_step_key, "g == s should be avoided"
+                        
+                        is_goal_now = (current_step_key == goal_step_key)
+                        
+                        self.index_list.append(
+                            (hdf5_path, epi, current_step_key, next_step_key, goal_step_key, is_goal_now)
+                        )
+                    
     def __len__(self):
         return len(self.index_list)
     
     def __getitem__(self, index):
-        file_path, current_key, next_key, goal_key, done_mask = self.index_list[index]
+        file_path, epi_key, current_key, next_key, goal_key, is_goal_now = self.index_list[index]
         
         with h5py.File(file_path, 'r') as f:
-            current_obs = f[current_key]['obs']['birdview']['rendered'][:]
-            next_obs = f[next_key]['obs']['birdview']['rendered'][:]
-            goal_obs = f[goal_key]['obs']['birdview']['rendered'][:]
+            d = f[epi_key]
+            current_obs = d['birdview'][current_key]
+            next_obs = d['birdview'][next_key]
+            goal_obs =d['birdview'][goal_key]
             
         current_obs_tensor = torch.tensor(current_obs, dtype=torch.float32)
         next_obs_tensor = torch.tensor(next_obs, dtype=torch.float32)
         goal_obs_tensor = torch.tensor(goal_obs, dtype=torch.float32)
         
-        return (current_obs_tensor, next_obs_tensor, goal_obs_tensor, done_mask)
+        return (current_obs_tensor, next_obs_tensor, goal_obs_tensor, is_goal_now)
     
     def split_train_val(self):
         val_mask = get_val_mask(len(self), self.val_ratio, self.seed)
