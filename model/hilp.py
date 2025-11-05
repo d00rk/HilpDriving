@@ -12,34 +12,28 @@ from utils.utils import initialize_weights
 # Define the neural network for the Hilbert representation
 class HilbertRepresentation(nn.Module):
     def __init__(self, config):
-        super(HilbertRepresentation, self).__init__()
+        super().__init__()
         self.latent_dim = config.latent_dim
         
         self.feature_extractor = nn.Sequential(
-            nn.BatchNorm2d(3),
+            # nn.BatchNorm2d(3),
             nn.Conv2d(3, 8, 4, 4, 0),
             nn.BatchNorm2d(8),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Conv2d(8, 16, 4, 4, 0),
             nn.BatchNorm2d(16),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Conv2d(16, 32, 4, 2, 0),
             nn.BatchNorm2d(32),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
             nn.Linear(32*4*4, self.latent_dim),
-            nn.ReLU()
+            nn.ReLU(inplace=True)
         )
     
-    def forward(self, state):
-        if isinstance(state, np.ndarray):
-            state = torch.from_numpy(state).float()
-            
-        if state.dim == 4 and state.shape[1] != 3 and state.shape[-1] == 3:
-            state = state.permute(0, 3, 1, 2)   # (B, H, W, C) -> (B, C, H, W)
-        features = self.feature_extractor(state)
-        return features
+    def forward(self, x):
+        return self.feature_extractor(x)
     
     def initialize(self):
         self.apply(initialize_weights)

@@ -2,7 +2,7 @@ data:
     data_town: ["Town01", "Town02", "Town03", "Town04", "Town05", "Town06", "Town10"]
     type: ["long", "short"]
     p: 0.2
-    num_workers: 4
+    num_workers: 0
     train_batch_size: 512
     val_batch_size: 512
     val_ratio: 0.2

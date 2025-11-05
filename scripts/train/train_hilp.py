@@ -44,12 +44,17 @@ def eval_hilp(model,
             next_state = next_state.to(device, non_blocking=True)
             goal = goal.to(device, non_blocking=True)
             is_goal_now = is_goal_now.to(device, non_blocking=True).float()
-        
-            phi_s = model(state)
-            phi_g = model(goal) 
-            phi_next_s = target_model(next_state)
-            phi_next_g = target_model(goal)
             
+            B, C, H, W = state.shape
+
+            sg = torch.cat([state, goal], dim=0)            # (2*B, C, H, W)
+            ng = torch.cat([next_state, goal], dim=0)       # (2*B, C, H, W)
+            
+            phi = model(sg)
+            phi_s, phi_g = phi[:B], phi[B:]
+            
+            phi_next = target_model(ng)
+            phi_next_s, phi_next_g = phi_next[:B], phi_next[B:]
             
             temporal_dist = torch.norm(phi_s - phi_g, dim=-1)       # (B, )
             reward = -1.0 * (1.0 - is_goal_now)
@@ -101,17 +106,21 @@ def train_hilp(model,
             goal =  goal.to(cfg.device, non_blocking=True)
             is_goal_now = is_goal_now.to(cfg.device, non_blocking=True).float()
             
+            B, C, H, W = state.shape
+            
             optimizer.zero_grad()
             
             with torch.cuda.amp.autocast():
                 # phi(s), phi(g)
-                phi_s = model(state)        # (B, 10)
-                phi_g = model(goal)         # (B, 10)
+                sg = torch.cat([state, goal], dim=0)
+                phi = model(sg)
+                phi_s, phi_g = phi[:B], phi[B:]
                 
                 with torch.inference_mode():
-                    # target_phi(s'), target_phi(g) 
-                    target_phi_next_s = target_model(next_state)         # (B, 10)
-                    target_phi_g = target_model(goal)                    # (B, 10)
+                    ng = torch.cat([next_state, goal], dim=0)
+                    phi_next = target_model(ng)
+                    # target_phi(s'), target_phi(g)
+                    target_phi_next_s, target_phi_g = phi_next[:B], phi_next[B:]
                 
                 temporal_dist = torch.norm(phi_s - phi_g, dim=-1)       # (B, )
                 
@@ -137,6 +146,13 @@ def train_hilp(model,
             global_step += 1
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
             
+            if wb:
+                wandb.log({"train/epoch": epoch,
+                            "train/global_step": global_step,
+                            "train/loss": loss.item(),
+                        })
+            
+            
         avg_loss = total_loss / len(train_dataloader)
         
         if verbose:
@@ -157,7 +173,6 @@ def train_hilp(model,
             wandb.log({"train/epoch": epoch,
                        "train/global_step": global_step,
                        "train/loss": avg_loss,
-                    #    "train/lr": lr_scheduler.get_last_lr()[0]
                        })
         
          
@@ -242,10 +257,8 @@ def main(config):
     dataset = GoalDataset(train_cfg.seed, data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
     
-    train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers,
-                                  pin_memory=False, persistent_workers=True, prefetch_factor=4)
-    val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=False, num_workers=data_cfg.num_workers,
-                                pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers, pin_memory=True, persistent_workers=True if data_cfg.num_workers > 0 else False)
+    val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=False, num_workers=data_cfg.num_workers, pin_memory=True, persistent_workers=True if data_cfg.num_workers > 0 else False)
     
     if cfg.verbose:
         print("Created Dataset, DataLoader.")

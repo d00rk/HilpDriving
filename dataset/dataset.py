@@ -3,6 +3,7 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 
 import h5py
+import threading
 import glob
 import random
 import copy
@@ -89,6 +90,9 @@ class GoalDataset(Dataset):
         self.val_ratio = cfg.val_ratio
         self.index_list = list()
         
+        self._file_cache = None
+        self._cache_lock = threading.Lock()
+        
         hdf5_paths = list()
         for town in cfg.data_town:
             for t in cfg.type:
@@ -130,23 +134,31 @@ class GoalDataset(Dataset):
     def __len__(self):
         return len(self.index_list)
     
+    def _get_file(self, path):
+        if self._file_cache is None:
+            self._file_cache = {}
+        f = self._file_cache.get(path)
+        if f is None:
+            f = h5py.File(
+                path, 'r', libver='latest', swmr=False, rdcc_nbytes=int(256*1024*1024), rdcc_nslots=1_000_003
+            )
+            self._file_cache[path] = f
+        return f
+    
     def __getitem__(self, index):
         file_path, epi_key, current_key, next_key, goal_key, is_goal_now = self.index_list[index]
-        
-        with h5py.File(file_path, 'r') as f:
-            d = f[epi_key]
-            current_obs = d['birdview'][current_key]
-            next_obs = d['birdview'][next_key]
-            goal_obs =d['birdview'][goal_key]
+        f = self._get_file(file_path)
+
+        d = f[epi_key]
+        current_obs =  torch.from_numpy(d['birdview'][current_key].astype('float32')) / 255.0
+        next_obs = torch.from_numpy(d['birdview'][next_key].astype('float32')) / 255.0
+        goal_obs = torch.from_numpy(d['birdview'][goal_key].astype('float32')) / 255.0
             
-        current_obs_tensor = torch.tensor(current_obs, dtype=torch.float32)
-        current_obs_tensor = current_obs_tensor.permute(2, 0, 1).contiguous()
-        next_obs_tensor = torch.tensor(next_obs, dtype=torch.float32)
-        next_obs_tensor = next_obs_tensor.permute(2, 0, 1).contiguous()
-        goal_obs_tensor = torch.tensor(goal_obs, dtype=torch.float32)
-        goal_obs_tensor = goal_obs_tensor.permute(2, 0, 1).contiguous()
+        current_obs = current_obs.permute(2, 0, 1).contiguous() 
+        next_obs = next_obs.permute(2, 0, 1).contiguous()
+        goal_obs = goal_obs.permute(2, 0, 1).contiguous()
         
-        return (current_obs_tensor, next_obs_tensor, goal_obs_tensor, is_goal_now)
+        return (current_obs, next_obs, goal_obs, is_goal_now)
     
     def split_train_val(self):
         val_mask = get_val_mask(len(self), self.val_ratio, self.seed)
