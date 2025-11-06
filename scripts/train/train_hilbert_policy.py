@@ -161,31 +161,41 @@ def train(model,
           latent_dim,
           verbose,
           wb,
+          ckpt,
           checkpoint_dir,
           cfg,
           logger):
     model = model.to(cfg.device)
     q_function = q_function.to(cfg.device)
-    v_function = v_function.to(cfg.device)
     policy = policy.to(cfg.device)
     target_q_function = copy.deepcopy(q_function).requires_grad_(False).to(cfg.device)
+    if v_function is not None:
+        v_function = v_function.to(cfg.device)
     
     q_optimizer = torch.optim.AdamW(q_function.parameters(), lr=cfg.q_lr)
     policy_optimizer = torch.optim.AdamW(policy.parameters(), lr=cfg.policy_lr)
     v_optimizer = torch.optim.AdamW(v_function.parameters(), lr=cfg.v_lr) if v_function is not None else None
-    
     policy_lr_scheduler = CosineAnnealingLR(policy_optimizer, T_max=cfg.num_epochs*len(train_dataloader))
+    
+    if ckpt is not None:
+        q_optimizer.load_state_dict(ckpt['q_optimizer_state_dict'])
+        policy_optimizer.load_state_dict(ckpt['policy_optimizer_state_dict'])
+        policy_lr_scheduler.load_state_dict(ckpt['policy_lr_scheduler_state_dict'])
+        if v_optimizer is not None:
+            v_optimizer.load_state_dict(ckpt['v_optimizer_state_dict'])
+        del ckpt
     
     if verbose:
         print(f"[Torch] {cfg.device} is used.")
         print(f"[Train] Start at {dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}")
 
-    best_loss = np.inf
+    best_loss = float(np.inf)
     global_step = 0
     for epoch in range(cfg.num_epochs):
         q_function.train()
-        v_function.train()
         policy.train()
+        if v_function is not None:
+            v_function.train()
         
         total_q_loss = 0.0
         total_v_loss = 0.0 if cfg.algo == "iql" else None
@@ -345,7 +355,8 @@ def train(model,
                     "train/global_step": global_step,
                     "train/loss": avg_loss,
                     "train/q_loss": avg_q_loss,
-                    "train/policy_loss": avg_policy_loss}
+                    "train/policy_loss": avg_policy_loss,
+                    "train/lr": policy_lr_scheduler.get_last_lr()[0]}
         
         if cfg.algo == "iql":
             avg_v_loss = total_v_loss / len(train_dataloader)
@@ -390,6 +401,10 @@ def train(model,
                         'v_state_dict': v_function.state_dict(),
                         'policy_state_dict': policy.state_dict(),
                         'hilbert_representation_state_dict': model.state_dict(),
+                        'q_optimizer_state_dict': q_optimizer.state_dict(),
+                        'v_optimizer_state_dict': v_optimizer.state_dict(),
+                        'policy_optimizer_state_dict': policy_optimizer.state_dict(),
+                        'policy_lr_scheduler_state_dict': policy_lr_scheduler.state_dict(),
                         'loss': avg_loss,
                         'eval_loss': eval_loss  
                     }, checkpoint_path)
@@ -399,6 +414,9 @@ def train(model,
                         'q_state_dict': q_function.state_dict(),
                         'policy_state_dict': policy.state_dict(),
                         'hilbert_representation_state_dict': model.state_dict(),
+                        'q_optimizer_state_dict': q_optimizer.state_dict(),
+                        'policy_optimizer_state_dict': policy_optimizer.state_dict(),
+                        'policy_lr_scheduler_state_dict': policy_lr_scheduler.state_dict(),
                         'loss': avg_loss,
                         'eval_loss': eval_loss
                     }, checkpoint_path)
@@ -447,6 +465,7 @@ def main(config):
     q_func.initialize()
     policy.initialize()
     
+    ckpt = None
     if cfg.resume:
         ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"data/outputs/hilbert_policy/{cfg.resume_ckpt_dir}/{train_cfg.algo}_*.pt")))
         ckpt = torch.load(ckpts[-1])
@@ -485,6 +504,7 @@ def main(config):
             latent_dim=model_cfg.latent_dim,
             verbose=cfg.verbose,
             wb=cfg.wb,
+            ckpt=ckpt,
             checkpoint_dir=checkpoint_dir,
             cfg=train_cfg,
             logger=logger)

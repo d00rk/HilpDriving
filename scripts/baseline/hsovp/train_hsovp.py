@@ -87,11 +87,17 @@ def train(encoder,
           val_dataloader,
           verbose,
           wb,
+          ckpt,
           checkpoint_dir,
           cfg,
           logger):
     optimizer = optim.AdamW(list(encoder.parameters()) + list(decoder.parameters()) + list(prior.parameters()), lr=cfg.lr)
     lr_scheduler = CosineAnnealingLR(optimizer, T_max=cfg.num_epochs*len(train_dataloader))
+    
+    if ckpt is not None:
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
+        del ckpt
     
     encoder = encoder.to(cfg.device)
     decoder = decoder.to(cfg.device)
@@ -200,13 +206,14 @@ def train(encoder,
                 if verbose:
                     print(f"Save best model of epoch {epoch}  |   Eval loss: {eval_loss:.4f}")
                 
-                checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch:04d}.pt")
+                checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch:04d}_loss_{eval_loss:.3f}.pt")
                 torch.save({
                     "epoch": epoch,
                     "encoder_state_dict": encoder.state_dict(),
                     "decoder_state_dict": decoder.state_dict(),
                     "prior_state_dict": prior.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "lr_scheduler_state_dict": lr_scheduler.state_dict(),
                     "loss": avg_loss,
                     "eval_loss": eval_loss
                 }, checkpoint_path)
@@ -251,6 +258,7 @@ def main(config):
     decoder.initialize()
     prior.initialize()
     
+    ckpt = None
     if cfg.resume:
         ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"data/outputs/hsovp/{cfg.resume_ckpt_dir}/*.pt")))
         ckpt = torch.load(ckpts[-1])
@@ -267,17 +275,27 @@ def main(config):
         
     checkpoint_dir = os.path.join(os.getcwd(), f"data/outputs/hsovp/{dt.datetime.now().strftime('%Y_%m_%d')}/{dt.datetime.now().strftime('%H_%M_%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
+    if cfg.verbose:
+        print(f"Created output directory: {checkpoint_dir}.")
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
-        
-    train(encoder=encoder, 
-          decoder=decoder, 
-          prior=prior,
-          train_dataloader=train_dataloader, 
-          val_dataloader=val_dataloader,
-          verbose=cfg.verbose,
-          wb=cfg.wb,
-          checkpoint_dir=checkpoint_dir,
-          cfg=train_cfg)
+    
+    logger = JsonLogger(path=os.path.join(checkpoint_dir, 'log.json'))
+    logger.start()
+    
+    try:
+        train(encoder=encoder, 
+            decoder=decoder, 
+            prior=prior,
+            train_dataloader=train_dataloader, 
+            val_dataloader=val_dataloader,
+            verbose=cfg.verbose,
+            wb=cfg.wb,
+            ckpt=ckpt,
+            checkpoint_dir=checkpoint_dir,
+            cfg=train_cfg,
+            logger=logger)
+    finally:
+        logger.stop()
     
 if __name__=="__main__":
     main()

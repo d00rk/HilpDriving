@@ -22,7 +22,7 @@ from model.policy import GaussianPolicy
 from model.value_function import ValueFunction, TwinQ
 from dataset.dataset import LatentDataset
 from utils.seed_utils import seed_all
-from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp, get_reward_statics
+from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp
 from utils.logger import JsonLogger
 
 
@@ -32,9 +32,7 @@ EXP_ADV_MAX = 100.0
 def eval(q_function,
          target_q_function,
          v_function,
-         policy, 
-         reward_mean,
-         reward_std,
+         policy,
          dataloader,
          epoch,
          cfg):
@@ -56,7 +54,6 @@ def eval(q_function,
             next_state = next_state.to(cfg.device, non_blocking=True)
             reward = reward.to(cfg.device, non_blocking=True)
             terminal = terminal.to(cfg.device, non_blocking=True)
-            normalized_reward = (reward - reward_mean) / (reward_std + 1e-6)
             if cfg.algo == "iql":
                 q_target = target_q_function(state, z)
                 v = v_function(state)
@@ -64,7 +61,7 @@ def eval(q_function,
                 adv = q_target - v
                 v_loss = asymmetric_l2_loss(adv, cfg.tau)
                 
-                targets = normalized_reward + (1.0 - terminal) * cfg.discount * next_v.detach()
+                targets = reward + (1.0 - terminal) * cfg.discount * next_v.detach()
                 q1, q2 = q_function.both(state, z)
                 q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
                 
@@ -87,7 +84,7 @@ def eval(q_function,
                 logp_next = dist_next.log_prob(z_next_pred).sum(dim=-1)
                 
                 q_next_target = target_q_function(next_state, z_next_pred)
-                target_q = normalized_reward + (1.0 - terminal) * cfg.discount * (q_next_target - cfg.alpha_entropy * logp_next)
+                target_q = reward + (1.0 - terminal) * cfg.discount * (q_next_target - cfg.alpha_entropy * logp_next)
                 
                 q1, q2 = q_function.both(state, z)
                 q_loss = sum(F.mse_loss(q, target_q) for q in [q1, q2]) / 2
@@ -147,12 +144,9 @@ def train(q_function,
           policy, 
           train_dataloader, 
           val_dataloader,
-          train_reward_mean,
-          train_reward_std,
-          val_reward_mean,
-          val_reward_std,
           verbose,
           wb,
+          ckpt,
           checkpoint_dir,
           cfg,
           logger):
@@ -167,6 +161,14 @@ def train(q_function,
     policy_optimizer = torch.optim.AdamW(policy.parameters(), lr=cfg.policy_lr)
     v_optimizer = torch.optim.AdamW(v_function.parameters(), lr=cfg.v_lr) if v_function is not None else None
     policy_lr_scheduler = CosineAnnealingLR(policy_optimizer, cfg.num_epochs*len(train_dataloader))
+    
+    if ckpt is not None:
+        q_optimizer.load_state_dict(ckpt['q_optimizer_state_dict'])
+        policy_optimizer.load_state_dict(ckpt['policy_optimizer_state_dict'])
+        policy_lr_scheduler.load_state_dict(ckpt['policy_lr_scheduler_state_dict'])
+        if v_optimizer is not None:
+            v_optimizer.load_state_dict(ckpt['v_optimizer_state_dict'])
+        del ckpt
     
     if verbose:
         print(f"[Torch] {cfg.device} is used.")
@@ -196,7 +198,6 @@ def train(q_function,
             next_state = next_state.to(cfg.device, non_blocking=True)
             reward = reward.to(cfg.device, non_blocking=True)
             terminal = terminal.to(cfg.device, non_blocking=True)
-            normalized_reward = (reward - train_reward_mean) / (train_reward_std + 1e-6)
             
             if cfg.algo == 'iql':
                 with torch.no_grad():
@@ -209,7 +210,7 @@ def train(q_function,
                 v_loss.backward()
                 v_optimizer.step()
                 
-                targets = normalized_reward + (1.0 - terminal) * cfg.discount * next_v.detach()
+                targets = reward + (1.0 - terminal) * cfg.discount * next_v.detach()
                 q1, q2 = q_function.both(state, z)
                 q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
                 q_optimizer.zero_grad(set_to_none=True)
@@ -242,7 +243,7 @@ def train(q_function,
                     z_next_pred = dist_next.rsample()
                     logp_next = dist_next.log_prob(z_next_pred).sum(dim=-1)
                     q_next_target = target_q_function(next_state, z_next_pred)
-                    target_q = normalized_reward + (1.0 - terminal) * cfg.discount * (q_next_target - cfg.alpha_entropy * logp_next)
+                    target_q = reward + (1.0 - terminal) * cfg.discount * (q_next_target - cfg.alpha_entropy * logp_next)
                 
                 q1, q2 = q_function.both(state, z)
                 q_loss = sum(F.mse_loss(q, target_q) for q in [q1, q2]) / 2
@@ -325,7 +326,8 @@ def train(q_function,
                     "train/global_step": global_step,
                     "train/loss": avg_loss,
                     "train/q_loss": avg_q_loss,
-                    "train/policy_loss": avg_policy_loss}
+                    "train/policy_loss": avg_policy_loss,
+                    "train/lr": policy_lr_scheduler.get_last_lr()[0]}
         
         if cfg.algo == "iql":
             avg_v_loss = total_v_loss / len(train_dataloader)
@@ -341,8 +343,6 @@ def train(q_function,
                                   v_function=v_function,
                                   policy=policy,
                                   dataloader=val_dataloader, 
-                                  reward_mean=val_reward_mean,
-                                  reward_std=val_reward_std,
                                   epoch=epoch,
                                   cfg=cfg)
             
@@ -365,6 +365,10 @@ def train(q_function,
                         'q_state_dict': q_function.state_dict(),
                         'v_state_dict': v_function.state_dict(),
                         'policy_state_dict': policy.state_dict(),
+                        'q_optimizer_state_dict': q_optimizer.state_dict(),
+                        'v_optimizer_state_dict': v_optimizer.state_dict(),
+                        'policy_optimizer_state_dict': policy_optimizer.state_dict(),
+                        'policy_lr_scheduler_state_dict': policy_lr_scheduler.state_dict(),
                         'loss': avg_loss,
                         'eval_loss': eval_loss
                     }, checkpoint_path)
@@ -373,6 +377,9 @@ def train(q_function,
                         'epoch': epoch,
                         'q_state_dict': q_function.state_dict(),
                         'policy_state_dict': policy.state_dict(),
+                        'q_optimizer_state_dict': q_optimizer.state_dict(),
+                        'policy_optimizer_state_dict': policy_optimizer.state_dict(),
+                        'policy_lr_scheduler_state_dict': policy_lr_scheduler.state_dict(),
                         'loss': avg_loss,
                         'eval_loss': eval_loss 
                     }, checkpoint_path)
@@ -411,8 +418,6 @@ def main(config):
     train_dataset, val_dataset = dataset.split_train_val()
     train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers, pin_memory=True)
     val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=False, num_workers=data_cfg.num_workers, pin_memory=True)
-    train_reward_mean, train_reward_std = get_reward_statics(train_dataloader)
-    val_reward_mean, val_reward_std = get_reward_statics(val_dataloader)
  
     # Create model
     q_func = TwinQ(model_cfg)
@@ -420,6 +425,7 @@ def main(config):
     q_func.initialize()
     policy.initialize()
     
+    ckpt = None
     if cfg.resume:
         ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"data/outputs/hsovp_high_level_policy/{cfg.resume_ckpt_dir}/{train_cfg.algo}_*.pt")))
         ckpt = torch.load(ckpts[-1])
@@ -453,12 +459,9 @@ def main(config):
             policy=policy, 
             train_dataloader=train_dataloader,
             val_dataloader=val_dataloader,
-            train_reward_mean=train_reward_mean,
-            train_reward_std=train_reward_std,
-            val_reward_mean=val_reward_mean,
-            val_reward_std=val_reward_std,
             verbose=cfg.verbose,
             wb=cfg.wb,
+            ckpt=ckpt,
             checkpoint_dir=checkpoint_dir,
             cfg=train_cfg,
             logger=logger)

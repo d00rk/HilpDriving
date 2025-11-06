@@ -76,6 +76,7 @@ def train_hilp(model,
                scaler,
                verbose,
                wb,
+               ckpt,
                checkpoint_dir,
                cfg,
                logger):
@@ -86,12 +87,17 @@ def train_hilp(model,
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
     lr_scheduler = CosineAnnealingLR(optimizer, T_max=cfg.num_epochs*len(train_dataloader))
     
+    if ckpt is not None:
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
+        del ckpt
+    
     if verbose:
         print(f"[Torch] {cfg.device} is used.")
-        print(f"[Train] Start at {dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}")
+        print(f"[Train] Start at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
     
-    best_loss = np.inf
-    best_train_loss = np.inf
+    best_loss = float(np.inf)
+    best_train_loss = float(np.inf)
     global_step = 0
     early_stop_counter = 0
     for epoch in range(cfg.num_epochs):
@@ -135,6 +141,7 @@ def train_hilp(model,
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
+            lr_scheduler.step()
             scaler.update()
 
             if (i % cfg.target_update_frequency) == 0:
@@ -143,13 +150,13 @@ def train_hilp(model,
                     for param, target_param in zip(model.parameters(), target_model.parameters()):
                         target_param.data.mul_(1 - tau).add_(param.data, alpha=tau)
             
-            
             total_loss += loss.item()
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
             
             step_log = {"train/epoch": epoch,
                         "train/global_step": global_step,
                         "train/loss": loss.item(),
+                        "train/lr": lr_scheduler.get_last_lr()[0]
                         }
             
             logger.log(step_log)
@@ -160,9 +167,6 @@ def train_hilp(model,
             
         avg_loss = total_loss / len(train_dataloader)
         
-        if verbose:
-            print(f"[Train] Epoch {epoch}/{cfg.num_epochs}   |   Loss: {avg_loss:.4f}")
-            
         if avg_loss <= best_train_loss:
             best_train_loss = avg_loss
             early_stop_counter = 0
@@ -174,12 +178,15 @@ def train_hilp(model,
                 print(f"[Train] Early stopped at epoch {epoch}")
             break
         
-        if wb:
-            wandb.log({"train/epoch": epoch,
-                       "train/global_step": global_step,
-                       "train/loss": avg_loss,
-                       })
+        step_log = {"train/epoch": epoch,
+                    "train/global_step": global_step,
+                    "train/loss": avg_loss,
+                    "train/lr": lr_scheduler.get_last_lr()[0]
+                    }
         
+        logger.log(step_log)
+        if wb:
+            wandb.log(step_log, step=global_step)
          
         if epoch % cfg.eval_frequency == 0:
             eval_loss = eval_hilp(model=model, 
@@ -215,6 +222,7 @@ def train_hilp(model,
                     "epoch": epoch,
                     "hilbert_representation_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "lr_scheduler_state_dict": lr_scheduler.state_dict(),
                     "loss": avg_loss,
                     "eval_loss": eval_loss
                 }, checkpoint_path)
