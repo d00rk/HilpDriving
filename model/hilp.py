@@ -29,7 +29,6 @@ class HilbertRepresentation(nn.Module):
             nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
             nn.Linear(32*4*4, self.latent_dim),
-            nn.ReLU(inplace=True)
         )
     
     def forward(self, x):

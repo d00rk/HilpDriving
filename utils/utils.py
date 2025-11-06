@@ -135,4 +135,28 @@ def parse_route_xml(route_xml):
         }
         all_routes.append(route_info)
         
-    return all_routes                    
+    return all_routes
+
+def gaussian_nll(action, mu, log_std):
+    """Compute negative log-likelihood of a Gaussian with diagonal covariance.
+    action, mu, log_std: shape [B, A]
+    Returns per-sample scalar NLL: shape [B]
+    """
+    # clamp for numerical stability
+    log_std = torch.clamp(log_std, min=-20.0, max=2.0)
+    var = torch.exp(2.0 * log_std)  # since log_std = log(sigma)
+    nll = 0.5 * ((action - mu)**2 / var + 2.0 * log_std + np.log(2.0 * np.pi))
+    return nll.sum(dim=-1)  # sum over action dims
+
+def kl_diag_gaussians_logvar(mu_q, logvar_q, mu_p, logvar_p):
+    """KL( N(mu_q, diag(exp(logvar_q))) || N(mu_p, diag(exp(logvar_p))) )
+    Returns per-sample scalar KL: shape [B]
+    """
+    # clamp logvars for stability
+    logvar_q = torch.clamp(logvar_q, min=-10.0, max=10.0)
+    logvar_p = torch.clamp(logvar_p, min=-10.0, max=10.0)
+    var_q = torch.exp(logvar_q)
+    var_p = torch.exp(logvar_p)
+    # KL for diagonal Gaussians
+    kl = 0.5 * ( (logvar_p - logvar_q) + (var_q + (mu_q - mu_p)**2) / var_p - 1.0 )
+    return kl.sum(dim=-1)  # sum over latent dims

@@ -23,6 +23,7 @@ from model.hilp import HilbertRepresentation
 from dataset.dataset import GoalDataset
 from utils.seed_utils import seed_all
 from utils.utils import l2_expectile_loss
+from utils.logger import JsonLogger
 
 
 def eval_hilp(model, 
@@ -76,13 +77,14 @@ def train_hilp(model,
                verbose,
                wb,
                checkpoint_dir,
-               cfg):
+               cfg,
+               logger):
     
     model = model.to(cfg.device)
     target_model = target_model.to(cfg.device)
     
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
-    # lr_scheduler = CosineAnnealingLR(optimizer, T_max=cfg.num_epochs)
+    lr_scheduler = CosineAnnealingLR(optimizer, T_max=cfg.num_epochs*len(train_dataloader))
     
     if verbose:
         print(f"[Torch] {cfg.device} is used.")
@@ -143,15 +145,18 @@ def train_hilp(model,
             
             
             total_loss += loss.item()
-            global_step += 1
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
             
-            if wb:
-                wandb.log({"train/epoch": epoch,
-                            "train/global_step": global_step,
-                            "train/loss": loss.item(),
-                        })
+            step_log = {"train/epoch": epoch,
+                        "train/global_step": global_step,
+                        "train/loss": loss.item(),
+                        }
             
+            logger.log(step_log)
+            if wb:
+                wandb.log(step_log, step=global_step)
+            
+            global_step += 1
             
         avg_loss = total_loss / len(train_dataloader)
         
@@ -188,14 +193,23 @@ def train_hilp(model,
             
             if verbose:
                 print(f"[Validation] Loss: {eval_loss:.4f}")
+            
+            eval_log = {'eval/epoch': epoch,
+                        'eval/global_step': global_step,
+                        'eval/loss': eval_loss}
+            
+            logger.log(eval_log)
             if wb:
-                wandb.log({"eval/loss": eval_loss})
+                wandb.log(eval_log, step=global_step)
             
             if eval_loss <= best_loss:
-                if verbose:
-                    print(f"Save best model of epoch {epoch}")
+                import gc
+                gc.collect()
                 
-                checkpoint_path = os.path.join(checkpoint_dir, f"hilbert_representation_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_epoch_{epoch}.pt")
+                if verbose:
+                    print(f"Save best model of epoch {epoch} (loss={eval_loss:.4f})")
+                
+                checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch:04d}_loss_{eval_loss:.3f}.pt")
                 
                 torch.save({
                     "epoch": epoch,
@@ -207,7 +221,7 @@ def train_hilp(model,
                 best_loss = eval_loss
                 
     if verbose:            
-        print(f"[Train] Finished at {dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}")
+        print(f"[Train] Finished at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
 
 
 
@@ -218,7 +232,7 @@ def main(config):
     cfg = OmegaConf.load(CONFIG_FILE)
 
     if cfg.resume:
-        resum_conf = OmegaConf.load(os.path.join(os.getcwd(), f"outputs/hilp/{cfg.resume_ckpt_dir}/{config}.yaml"))
+        resum_conf = OmegaConf.load(os.path.join(os.getcwd(), f"data/outputs/hilp/{cfg.resume_ckpt_dir}/{config}.yaml"))
         cfg.data = resum_conf.data
         cfg.model = resum_conf.model
         cfg.train = resum_conf.train
@@ -244,15 +258,12 @@ def main(config):
     scaler = torch.cuda.amp.GradScaler(enabled=True)
     
     if cfg.resume:
-        ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"outputs/hilp/{cfg.resume_ckpt_dir}/hilbert_representation_*.pt")))
+        ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"data/outputs/hilp/{cfg.resume_ckpt_dir}/*.pt")))
         ckpt = torch.load(ckpts[-1])
         if cfg.verbose:
             print(f"Resume from {ckpts[-1]}")
         model.load_state_dict(ckpt["hilbert_representation_state_dict"])
         target_model.load_state_dict(ckpt["hilbert_representation_state_dict"])
-    
-    if cfg.verbose:
-        print("Create dataset")
         
     dataset = GoalDataset(train_cfg.seed, data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
@@ -263,28 +274,33 @@ def main(config):
     if cfg.verbose:
         print("Created Dataset, DataLoader.")
     
+    checkpoint_dir = os.path.join(os.getcwd(), f"data/outputs/hilp/{dt.datetime.now().strftime('%Y_%m_%d')}/{dt.datetime.now().strftime('%H_%M_%S')}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    if cfg.verbose:
+        print(f"Created output directory: {checkpoint_dir}.")
+    OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
+    
+    logger = JsonLogger(path=os.path.join(checkpoint_dir, "log.json"))
+    logger.start()
     if cfg.wb:
         wandb.init(project=cfg.wandb_project,
                    config=OmegaConf.to_container(cfg, resolve=True))
         wandb.run.tags = cfg.wandb_tag
         wandb.run.name = f"{cfg.wandb_name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    checkpoint_dir = os.path.join(os.getcwd(), f"data/outputs/hilp/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
-    
-    if cfg.verbose:
-        print(f"Created output directory: {checkpoint_dir}.")
-    
-    train_hilp(model=model, 
-               target_model=target_model, 
-               train_dataloader=train_dataloader, 
-               val_dataloader=val_dataloader,
-               scaler=scaler,
-               verbose=cfg.verbose, 
-               wb=cfg.wb,
-               checkpoint_dir=checkpoint_dir,
-               cfg=train_cfg)
+    try:
+        train_hilp(model=model, 
+                target_model=target_model, 
+                train_dataloader=train_dataloader, 
+                val_dataloader=val_dataloader,
+                scaler=scaler,
+                verbose=cfg.verbose, 
+                wb=cfg.wb,
+                checkpoint_dir=checkpoint_dir,
+                cfg=train_cfg,
+                logger=logger)
+    finally:
+        logger.stop()
 
 
 if __name__=="__main__":
