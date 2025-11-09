@@ -18,13 +18,49 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.backends.cudnn as cudnn
+import torch.multiprocessing as mp
 
 from model.hilp import HilbertRepresentation
 from dataset.dataset import GoalDataset
 from utils.seed_utils import seed_all
 from utils.utils import l2_expectile_loss
 from utils.logger import JsonLogger
+from utils.multiprocessing import _worker_init_fn
 
+
+# Put this near the top of the file
+class CUDAPrefetcher:
+    """Asynchronously prefetch next batch to GPU using a separate CUDA stream."""
+    def __init__(self, loader, device):
+        self.loader = iter(loader)
+        self.stream = torch.cuda.Stream()
+        self.device = device
+        self.next_batch = None
+        self.preload()
+
+    def preload(self):
+        try:
+            batch = next(self.loader)
+        except StopIteration:
+            self.next_batch = None
+            return
+        with torch.cuda.stream(self.stream):
+            # unpack and move to GPU non-blocking
+            state, next_state, goal, is_goal_now = batch
+            self.next_batch = (
+                state.to(self.device, non_blocking=True).contiguous(memory_format=torch.channels_last),
+                next_state.to(self.device, non_blocking=True).contiguous(memory_format=torch.channels_last),
+                goal.to(self.device, non_blocking=True).contiguous(memory_format=torch.channels_last),
+                is_goal_now.to(self.device, non_blocking=True).float(),
+            )
+
+    def next(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        batch = self.next_batch
+        self.preload()
+        return batch
+    
+    
 
 def eval_hilp(model, 
               target_model, 
@@ -74,7 +110,6 @@ def train_hilp(model,
                train_dataloader, 
                val_dataloader,
                scaler,
-               verbose,
                wb,
                ckpt,
                checkpoint_dir,
@@ -92,9 +127,8 @@ def train_hilp(model,
         lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
         del ckpt
     
-    if verbose:
-        print(f"[Torch] {cfg.device} is used.")
-        print(f"[Train] Start at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
+    print(f"[Torch] {cfg.device} is used.")
+    print(f"[Train] Start at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
     
     best_loss = float(np.inf)
     best_train_loss = float(np.inf)
@@ -153,15 +187,16 @@ def train_hilp(model,
             total_loss += loss.item()
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
             
-            step_log = {"train/epoch": epoch,
-                        "train/global_step": global_step,
-                        "train/loss": loss.item(),
-                        "train/lr": lr_scheduler.get_last_lr()[0]
-                        }
-            
-            logger.log(step_log)
-            if wb:
-                wandb.log(step_log, step=global_step)
+            if (i % cfg.log_frequency) == 0:
+                step_log = {"train/epoch": epoch,
+                            "train/global_step": global_step,
+                            "train/loss": loss.item(),
+                            "train/lr": lr_scheduler.get_last_lr()[0]
+                            }
+                
+                logger.log(step_log)
+                if wb:
+                    wandb.log(step_log, step=global_step)
             
             global_step += 1
             
@@ -174,8 +209,7 @@ def train_hilp(model,
             early_stop_counter += 1
             
         if early_stop_counter >= cfg.patience:
-            if verbose:
-                print(f"[Train] Early stopped at epoch {epoch}")
+            print(f"[Train] Early stopped at epoch {epoch}")
             break
         
         step_log = {"train/epoch": epoch,
@@ -198,8 +232,7 @@ def train_hilp(model,
                                   expectile_tau=cfg.expectile_tau,
                                   device=cfg.device)
             
-            if verbose:
-                print(f"[Validation] Loss: {eval_loss:.4f}")
+            print(f"[Validation] Loss: {eval_loss:.4f}")
             
             eval_log = {'eval/epoch': epoch,
                         'eval/global_step': global_step,
@@ -213,8 +246,7 @@ def train_hilp(model,
                 import gc
                 gc.collect()
                 
-                if verbose:
-                    print(f"Save best model of epoch {epoch} (loss={eval_loss:.4f})")
+                print(f"Save best model of epoch {epoch} (loss={eval_loss:.4f})")
                 
                 checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch:04d}_loss_{eval_loss:.3f}.pt")
                 
@@ -228,8 +260,7 @@ def train_hilp(model,
                 }, checkpoint_path)
                 best_loss = eval_loss
                 
-    if verbose:            
-        print(f"[Train] Finished at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
+    print(f"[Train] Finished at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
 
 
 
@@ -265,27 +296,40 @@ def main(config):
     
     scaler = torch.cuda.amp.GradScaler(enabled=True)
     
+    ckpt = None
     if cfg.resume:
         ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"data/outputs/hilp/{cfg.resume_ckpt_dir}/*.pt")))
         ckpt = torch.load(ckpts[-1])
-        if cfg.verbose:
-            print(f"Resume from {ckpts[-1]}")
+        print(f"Resume from {ckpts[-1]}")
         model.load_state_dict(ckpt["hilbert_representation_state_dict"])
         target_model.load_state_dict(ckpt["hilbert_representation_state_dict"])
         
     dataset = GoalDataset(train_cfg.seed, data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
     
-    train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers, pin_memory=True, persistent_workers=True if data_cfg.num_workers > 0 else False)
-    val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=False, num_workers=data_cfg.num_workers, pin_memory=True, persistent_workers=True if data_cfg.num_workers > 0 else False)
-    
-    if cfg.verbose:
-        print("Created Dataset, DataLoader.")
+    train_dataloader = DataLoader(
+        train_dataset, 
+        batch_size=data_cfg.train_batch_size, 
+        shuffle=True, 
+        num_workers=data_cfg.num_workers,
+        pin_memory=data_cfg.pin_memory,
+        pin_memory_device=train_cfg.device,
+        persistent_workers=(data_cfg.num_workers>0),
+        worker_init_fn=_worker_init_fn,
+        )
+    val_dataloader = DataLoader(
+        val_dataset, 
+        batch_size=data_cfg.val_batch_size, 
+        shuffle=False, 
+        num_workers=data_cfg.num_workers, 
+        pin_memory=data_cfg.pin_memory,
+        pin_memory_device=train_cfg.device,
+        persistent_workers=(data_cfg.num_workers>0),
+        worker_init_fn=_worker_init_fn,
+        )
     
     checkpoint_dir = os.path.join(os.getcwd(), f"data/outputs/hilp/{dt.datetime.now().strftime('%Y_%m_%d')}/{dt.datetime.now().strftime('%H_%M_%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
-    if cfg.verbose:
-        print(f"Created output directory: {checkpoint_dir}.")
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
     
     logger = JsonLogger(path=os.path.join(checkpoint_dir, "log.json"))
@@ -302,14 +346,16 @@ def main(config):
                 train_dataloader=train_dataloader, 
                 val_dataloader=val_dataloader,
                 scaler=scaler,
-                verbose=cfg.verbose, 
+                ckpt=ckpt, 
                 wb=cfg.wb,
                 checkpoint_dir=checkpoint_dir,
                 cfg=train_cfg,
-                logger=logger)
+                logger=logger,
+                )
     finally:
         logger.stop()
 
 
 if __name__=="__main__":
+    mp.set_start_method("spawn", force=True)
     main()
