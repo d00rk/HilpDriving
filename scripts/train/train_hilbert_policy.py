@@ -5,18 +5,21 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 
+import wandb
+import datetime as dt
+import numpy as np
+import click
+from tqdm import tqdm
+import copy
+import glob
+from omegaconf import OmegaConf
+
 import torch
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-import numpy as np
-import wandb
-import datetime as dt
-import click
-import tqdm
-import copy
-import glob
-from omegaconf import OmegaConf
+import torch.multiprocessing as mp
+from torch.distributions import Normal
 
 from model.hilp import HilbertRepresentation
 from model.value_function import TwinQforHilbert, ValueFunctionforHilbert
@@ -25,7 +28,7 @@ from dataset.dataset import SubTrajDataset
 from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, log_sum_exp
 from utils.seed_utils import seed_all
 from utils.sampler import sample_latent_vectors
-from utils.logger import JsonLogger
+from utils.logger import JsonLogger, _stats_dict
 
 
 EXP_ADV_MAX = 100.
@@ -40,9 +43,20 @@ def eval(model,
          latent_dim,
          epoch,
          cfg):
+    q_function.eval()
+    policy.eval()
+    if v_function is not None:
+        v_function.eval()
+    
     eval_loss = {}
-    pbar = tqdm.tqdm(enumerate(dataloader), total=len(dataloader), desc=f"[Validation] Epoch {epoch}/{cfg.num_epochs}", leave=True, ncols=100)
-    with torch.no_grad():
+    pbar = tqdm(
+        enumerate(dataloader), 
+        total=len(dataloader), 
+        desc=f"[Validation] Epoch {epoch}/{cfg.num_epochs}", 
+        leave=True, 
+        ncols=100
+        )
+    with torch.inference_mode(), torch.cuda.amp.autocast(enabled=cfg.use_amp):
         total_loss = 0.0
         total_q_loss = 0.0
         total_v_loss = 0.0 if cfg.algo == "iql" else None
@@ -53,16 +67,16 @@ def eval(model,
             next_state = next_state.to(cfg.device, non_blocking=True) 
             terminal = terminal.to(cfg.device, non_blocking=True)
             
-            _, _, a, b, c = state.shape
-            B, S, _ = action.shape
+            B, L, C, H, W = state.shape
+            B, S, A = action.shape
             
             z = sample_latent_vectors(batch_size=B, latent_dim=latent_dim)
             z_expand = z.unsqueeze(1).expand(B, S, latent_dim).contiguous().view(B*S, latent_dim)
             z_expand = z_expand.to(cfg.device)
             
-            state = state.view(B*S, a, b, c)
+            state = state.view(B*S, C, H, W)
             action = action.view(B*S, -1)
-            next_state = next_state.view(B*S, a, b, c)
+            next_state = next_state.view(B*S, C, H, W)
             terminal = terminal.view(B*S)
             
             phi_s = model(state)
@@ -82,7 +96,7 @@ def eval(model,
                 
                 exp_adv = torch.exp(cfg.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
                 a_mu, a_logstd = policy(state, z_expand)
-                dist = torch.distributions.Normal(a_mu, a_logstd.exp())
+                dist = Normal(a_mu, a_logstd.exp())
                 log_prob = dist.log_prob(action).sum(dim=-1)
                 policy_loss = -(exp_adv * log_prob).mean()
                 
@@ -94,7 +108,7 @@ def eval(model,
             
             elif cfg.algo == 'cql':
                 a_next_mu, a_next_logstd = policy(next_state, z_expand)
-                dist_next = torch.distributions.Normal(a_next_mu, a_next_logstd.exp())
+                dist_next = Normal(a_next_mu, a_next_logstd.exp())
                 a_next_pred = dist_next.rsample()
                 logp_next = dist_next.log_prob(a_next_pred).sum(dim=-1)
                 
@@ -128,8 +142,8 @@ def eval(model,
                 t_q_loss = q_loss + cql_loss_total
                 
                 a_mu, a_logstd = policy(state, z_expand)
-                a_pred = torch.distributions.Normal(a_mu, a_logstd.exp()).rsample()
-                log_prob = torch.distributions.Normal(a_mu, a_logstd.exp()).log_prob(a_pred).sum(dim=-1)
+                a_pred = Normal(a_mu, a_logstd.exp()).rsample()
+                log_prob = Normal(a_mu, a_logstd.exp()).log_prob(a_pred).sum(dim=-1)
                 q_new = q_function(state, z_expand, a_pred)
                 policy_loss = (cfg.alpha_entropy * log_prob - q_new).mean()
                 
@@ -138,34 +152,39 @@ def eval(model,
                 total_q_loss += t_q_loss.item()
                 total_policy_loss += policy_loss.item()
 
-        avg_loss = total_loss /len(dataloader)
+        avg_loss = total_loss / len(dataloader)
         avg_q_loss = total_q_loss / len(dataloader)
         avg_v_loss = total_v_loss / len(dataloader) if cfg.algo == "iql" else None
         avg_policy_loss = total_policy_loss / len(dataloader)
-        
+    
         eval_loss["eval/loss"] = avg_loss
         eval_loss["eval/q_loss"] = avg_q_loss
         eval_loss["eval/policy_loss"] = avg_policy_loss
         if cfg.algo == "iql":
             eval_loss["eval/v_loss"] = avg_v_loss
-        
-        return eval_loss    
+    
+    return eval_loss
 
 
-def train(model, 
-          q_function,
-          v_function,
-          policy, 
-          train_dataloader, 
-          val_dataloader,  
-          latent_dim,
-          verbose,
-          wb,
-          ckpt,
-          checkpoint_dir,
-          cfg,
-          logger):
+def train(
+    model, 
+    q_function,
+    v_function,
+    policy,
+    scaler,
+    train_dataloader, 
+    val_dataloader,  
+    latent_dim,
+    wb,
+    ckpt,
+    checkpoint_dir,
+    cfg,
+    logger
+    ):
+    
     model = model.to(cfg.device)
+    model.eval()            # hilbert representation
+    
     q_function = q_function.to(cfg.device)
     policy = policy.to(cfg.device)
     target_q_function = copy.deepcopy(q_function).requires_grad_(False).to(cfg.device)
@@ -185,9 +204,8 @@ def train(model,
             v_optimizer.load_state_dict(ckpt['v_optimizer_state_dict'])
         del ckpt
     
-    if verbose:
-        print(f"[Torch] {cfg.device} is used.")
-        print(f"[Train] Start at {dt.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}")
+    print(f"[Torch] {cfg.device} is used.")
+    print(f"[Train] Start at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
 
     best_loss = float(np.inf)
     global_step = 0
@@ -202,28 +220,30 @@ def train(model,
         total_policy_loss = 0.0
         total_loss = 0.0
         
-        progress_bar = tqdm.tqdm(enumerate(train_dataloader), 
-                                 total=len(train_dataloader), 
-                                 desc=f"[Train] Epoch {epoch}/{cfg.num_epochs}", 
-                                 leave=True, 
-                                 ncols=100)
+        pbar = tqdm(
+            enumerate(train_dataloader), 
+            total=len(train_dataloader), 
+            desc=f"[Train] Epoch {epoch}/{cfg.num_epochs}", 
+            leave=True, 
+            ncols=100
+            )
         
-        for i, (state, action, next_state, _, terminal, _) in progress_bar:
+        for i, (state, action, next_state, _, terminal, _) in pbar:
             state = state.to(cfg.device, non_blocking=True)
             action = action.to(cfg.device, non_blocking=True) 
             next_state = next_state.to(cfg.device, non_blocking=True) 
             terminal = terminal.to(cfg.device, non_blocking=True)
             
-            _, _, a, b, c = state.shape
-            B, S, _ = action.shape
+            B, S, C, H, W = state.shape
+            B, S, A = action.shape
             
             z = sample_latent_vectors(batch_size=B, latent_dim=latent_dim)
             z_expand = z.unsqueeze(1).expand(B, S, latent_dim).contiguous().view(B*S, latent_dim)
             z_expand = z_expand.to(cfg.device)
             
-            state = state.view(B*S, a, b, c)
+            state = state.view(B*S, C, H, W)
             action = action.view(B*S, -1)
-            next_state = next_state.view(B*S, a, b, c)
+            next_state = next_state.view(B*S, C, H, W)
             terminal = terminal.view(B*S)
             
             with torch.no_grad():
@@ -233,34 +253,39 @@ def train(model,
             intrinsic_reward = (disp * z_expand).sum(dim=-1)
             
             if cfg.algo == "iql":
-                with torch.no_grad():
-                   q_target = target_q_function(state, z_expand, action)
-                   next_v = v_function(next_state, z_expand)
-                v = v_function(state, z_expand)
-                adv = q_target - v
-                v_loss = asymmetric_l2_loss(adv, cfg.tau)
+                with torch.cuda.amp.autocast(enabled=cfg.use_amp):
+                    with torch.no_grad():
+                        q_target = target_q_function(state, z_expand, action)
+                        next_v = v_function(next_state, z_expand)
+                    v = v_function(state, z_expand)
+                    adv = q_target - v
+                    v_loss = asymmetric_l2_loss(adv, cfg.tau)
                 v_optimizer.zero_grad(set_to_none=True)
-                v_loss.backward()
-                v_optimizer.step()
+                scaler.scale(v_loss).backward()
+                scaler.step(v_optimizer)
                 
-                targets = intrinsic_reward + (1.0 - terminal) * cfg.discount * next_v.detach()
-                q1, q2 = q_function.both(state, z_expand, action)
-                q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
+                with torch.cuda.amp.autocast(enabled=cfg.use_amp):
+                    targets = intrinsic_reward + (1.0 - terminal) * cfg.discount * next_v.detach()
+                    q1, q2 = q_function.both(state, z_expand, action)
+                    q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
                 q_optimizer.zero_grad(set_to_none=True)
-                q_loss.backward()
-                q_optimizer.step()
-                
+                scaler.scale(q_loss).backward()
+                scaler.step(q_optimizer)
+                    
                 update_exponential_moving_average(target_q_function, q_function, cfg.alpha)
                 
-                exp_adv = torch.exp(cfg.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
-                a_mu, a_logstd = policy(state, z_expand)
-                dist = torch.distributions.Normal(a_mu, a_logstd.exp())
-                log_prob = dist.log_prob(action).sum(dim=-1)
-                policy_loss = -(exp_adv * log_prob).mean()
+                with torch.cuda.amp.autocast(enabled=cfg.use_amp):
+                    exp_adv = torch.exp(cfg.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
+                    a_mu, a_logstd = policy(state, z_expand)
+                    dist = torch.distributions.Normal(a_mu, a_logstd.exp())
+                    log_prob = dist.log_prob(action).sum(dim=-1)
+                    policy_loss = -(exp_adv * log_prob).mean()
                 policy_optimizer.zero_grad(set_to_none=True)
-                policy_loss.backward()
-                policy_optimizer.step()
+                scaler.scale(policy_loss).backward()
+                scaler.step(policy_optimizer)
                 policy_lr_scheduler.step()
+                
+                scaler.update()
                 
                 loss = v_loss.item() + q_loss.item() + policy_loss.item()
                 total_loss += loss
@@ -269,58 +294,62 @@ def train(model,
                 total_policy_loss += policy_loss.item()
             
             elif cfg.algo == 'cql':
-                with torch.no_grad():
-                    a_next_mu, a_next_logstd = policy(next_state, z_expand)
-                    dist_next = torch.distributions.Normal(a_next_mu, a_next_logstd.exp())
-                    a_next_pred = dist_next.rsample()
-                    logp_next = dist_next.log_prob(a_next_pred).sum(dim=-1)
+                with torch.cuda.amp.autocast(enabled=cfg.use_amp):
+                    with torch.no_grad():
+                        a_next_mu, a_next_logstd = policy(next_state, z_expand)
+                        dist_next = torch.distributions.Normal(a_next_mu, a_next_logstd.exp())
+                        a_next_pred = dist_next.rsample()
+                        logp_next = dist_next.log_prob(a_next_pred).sum(dim=-1)
+                        
+                        q_next_target = target_q_function(next_state, z_expand, a_next_pred)
+                        target_q = intrinsic_reward + (1.0 - terminal) * cfg.discount * (q_next_target - cfg.alpha_entropy * logp_next)
+                
+                    q1, q2 = q_function.both(state, z_expand, action)
+                    Q_loss = sum(F.mse_loss(q, target_q) for q in [q1, q2]) / 2
                     
-                    q_next_target = target_q_function(next_state, z_expand, a_next_pred)
-                    target_q = intrinsic_reward + (1.0 - terminal) * cfg.discount * (q_next_target - cfg.alpha_entropy * logp_next)
-                
-                q1, q2 = q_function.both(state, z_expand, action)
-                Q_loss = sum(F.mse_loss(q, target_q) for q in [q1, q2]) / 2
-                
-                B, A = action.shape
-                random_acts = torch.rand(B, cfg.num_random, A, device=cfg.device)
-                random_acts = random_acts * (cfg.action_high - cfg.action_low) + cfg.action_low
-                
-                z_tiled = z_expand.unsqueeze(1).expand(B, cfg.num_random, z_expand.size(-1))
-                z_tiled = z_tiled.reshape(B*cfg.num_random, z_expand.size(-1))
-                
-                obs_expand = state.unsqueeze(1).expand(-1, cfg.num_random, *state.shape[1:])
-                obs_expand = obs_expand.reshape(B*cfg.num_random, *state.shape[1:])
-                
-                random_acts = random_acts.view(B*cfg.num_random, A)
-                
-                q1_random, q2_random = q_function.both(obs_expand, z_tiled, random_acts)
-                q1_random = q1_random.view(B, cfg.num_random)
-                q2_random = q2_random.view(B, cfg.num_random)
-                
-                lse_q1 = log_sum_exp(q1_random / cfg.temperature, dim=1)
-                cql_q1 = (lse_q1 * cfg.temperature - q1).mean()
-                lse_q2 = log_sum_exp(q2_random / cfg.temperature, dim=1)
-                cql_q2 = (lse_q2 * cfg.temperature - q2).mean()
-                cql_loss_total = cfg.cql_alpha * (cql_q1 + cql_q2)
-                q_loss = Q_loss + cql_loss_total
+                    B, A = action.shape
+                    random_acts = torch.rand(B, cfg.num_random, A, device=cfg.device)
+                    random_acts = random_acts * (cfg.action_high - cfg.action_low) + cfg.action_low
+                    
+                    z_tiled = z_expand.unsqueeze(1).expand(B, cfg.num_random, z_expand.size(-1))
+                    z_tiled = z_tiled.reshape(B*cfg.num_random, z_expand.size(-1))
+                    
+                    obs_expand = state.unsqueeze(1).expand(-1, cfg.num_random, *state.shape[1:])
+                    obs_expand = obs_expand.reshape(B*cfg.num_random, *state.shape[1:])
+                    
+                    random_acts = random_acts.view(B*cfg.num_random, A)
+                    
+                    q1_random, q2_random = q_function.both(obs_expand, z_tiled, random_acts)
+                    q1_random = q1_random.view(B, cfg.num_random)
+                    q2_random = q2_random.view(B, cfg.num_random)
+                    
+                    lse_q1 = log_sum_exp(q1_random / cfg.temperature, dim=1)
+                    cql_q1 = (lse_q1 * cfg.temperature - q1).mean()
+                    lse_q2 = log_sum_exp(q2_random / cfg.temperature, dim=1)
+                    cql_q2 = (lse_q2 * cfg.temperature - q2).mean()
+                    cql_loss_total = cfg.cql_alpha * (cql_q1 + cql_q2)
+                    q_loss = Q_loss + cql_loss_total
                 
                 q_optimizer.zero_grad(set_to_none=True)
-                q_loss.backward()
-                q_optimizer.step()
+                scaler.scale(q_loss).backward()
+                scaler.step(q_optimizer)
                 
                 update_exponential_moving_average(target_q_function, q_function, cfg.alpha)
                 
-                a_mu, a_logstd = policy(state, z)
-                a_pred = torch.distributions.Normal(a_mu, a_logstd.exp()).rsample()
-                log_prob = torch.distributions.Normal(a_mu, a_logstd.exp()).log_prob(a_pred).sum(dim=-1)
-                
-                q_new = q_function(state, z, a_pred)
-                policy_loss = (cfg.alpha_entropy * log_prob - q_new).mean()
+                with torch.cuda.amp.autocast(enabled=cfg.use_amp):
+                    a_mu, a_logstd = policy(state, z)
+                    a_pred = Normal(a_mu, a_logstd.exp()).rsample()
+                    log_prob = Normal(a_mu, a_logstd.exp()).log_prob(a_pred).sum(dim=-1)
+                    
+                    q_new = q_function(state, z, a_pred)
+                    policy_loss = (cfg.alpha_entropy * log_prob - q_new).mean()
                 
                 policy_optimizer.zero_grad(set_to_none=True)
-                policy_loss.backward()
-                policy_optimizer.step()
+                scaler.scale(policy_loss).backward()
+                scaler.step(policy_optimizer)
                 policy_lr_scheduler.step()
+                
+                scaler.update()
                 
                 loss = q_loss.item() + policy_loss.item()
                 total_loss += loss
@@ -329,23 +358,32 @@ def train(model,
             else:
                 raise ValueError(f"Invalid algorithm: {cfg.algo}")
             
-            step_log = {
-                'train/epoch': epoch,
-                'train/global_step': global_step,
-                'train/loss': loss.item(),
-                'train/q_loss': q_loss.item(),
-                'train/policy_loss': policy_loss.item(),
-                'train/lr': policy_lr_scheduler.get_last_lr()[0]
-            }
-            if cfg.algo == 'iql':
-                step_log['train/v_loss'] = v_loss.item()
-            
-            logger.log(step_log)
-            if wb:
-                wandb.log(step_log, step=global_step)
+            if (i % cfg.log_frequency) == 0:
+                step_log = {
+                    'train/epoch': epoch,
+                    'train/global_step': global_step,
+                    'train/loss': loss.item(),
+                    'train/q_loss': q_loss.item(),
+                    'train/policy_loss': policy_loss.item(),
+                    'train/lr': policy_lr_scheduler.get_last_lr()[0],
+                    'debug/has_nan_input': int(
+                        torch.isnan(state).any().item() or torch.isnan(next_state).any().item()
+                    ),
+                    'debug/disp': float(disp.mean()),
+                    'debug/intrinsic_reward': float(intrinsic_reward.mean())
+                }
+                if cfg.algo == 'iql':
+                    step_log['train/v_loss'] = v_loss.item()
+                
+                step_log.update(_stats_dict("debug/state", state))
+                step_log.update(_stats_dict("debug/next_state", next_state))
+                
+                logger.log(step_log)
+                if wb:
+                    wandb.log(step_log, step=global_step)
             
             global_step += 1
-            progress_bar.set_postfix({"Total Loss": f"{loss:.4f}"})
+            pbar.set_postfix({"Total Loss": f"{loss:.4f}"})
 
         avg_q_loss = total_q_loss / len(train_dataloader)
         avg_policy_loss = total_policy_loss / len(train_dataloader)
@@ -377,8 +415,7 @@ def train(model,
                              epoch=epoch,
                              cfg=cfg)
             
-            if verbose:
-                print(f"[Validation] Loss: {eval_loss_dict['eval/loss']:.4f}")
+            print(f"[Validation] Loss: {eval_loss_dict['eval/loss']:.4f}")
             
             logger.log(eval_loss_dict)
             if wb:
@@ -389,8 +426,7 @@ def train(model,
                 import gc
                 gc.collect()
                 
-                if verbose:
-                    print(f"Save best model of epoch {epoch} (loss={eval_loss:.4f})")
+                print(f"Save best model of epoch {epoch} (loss={eval_loss:.4f})")
                 
                 checkpoint_path = os.path.join(checkpoint_dir, f"{cfg.algo}_epoch_{epoch:04d}_loss_{eval_loss:.3f}.pt")
                 
@@ -422,8 +458,7 @@ def train(model,
                     }, checkpoint_path)
                 best_loss = eval_loss
     
-    if verbose:
-        print(f"[Train] Finished at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
+    print(f"[Train] Finished at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
 
 
 
@@ -445,21 +480,27 @@ def main(config):
     
     seed_all(train_cfg.seed)
 
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision('high')
+    
     # pretrained hilbert representation model
     HILP_DICT_PATH = os.path.join(os.getcwd(), f"data/outputs/hilp/{train_cfg.hilp_dir}/{train_cfg.hilp_dict_name}.pt")
     hilbert_representation = HilbertRepresentation(model_cfg)
     ckpt = torch.load(HILP_DICT_PATH)
     hilbert_representation.load_state_dict(ckpt['hilbert_representation_state_dict'])
     hilbert_representation.eval()
-        
+    for p in hilbert_representation.parameters():
+        p.requires_grad_(False)
+    
+    scaler = torch.cuda.amp.GradScaler(enabled=train_cfg.use_amp)
+    
     dataset = SubTrajDataset(train_cfg.seed, data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
     train_dataloader = DataLoader(train_dataset, batch_size=data_cfg.train_batch_size, shuffle=True, num_workers=data_cfg.num_workers, pin_memory=True)
     val_dataloader = DataLoader(val_dataset, batch_size=data_cfg.val_batch_size, shuffle=False, num_workers=data_cfg.num_workers, pin_memory=True)
     
-    if cfg.verbose:
-        print("Created Dataset, DataLoader.")
-        
     q_func = TwinQforHilbert(model_cfg)
     policy = GaussianPolicyforHilbert(model_cfg)
     q_func.initialize()
@@ -482,8 +523,7 @@ def main(config):
     
     checkpoint_dir = os.path.join(os.getcwd(), f"data/outputs/hilbert_policy/{dt.datetime.now().strftime('%Y_%m_%d')}/{dt.datetime.now().strftime('%H_%M_%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
-    if cfg.verbose:
-        print(f"Created output directory: {checkpoint_dir}.")
+    print(f"Created output directory: {checkpoint_dir}.")
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
     
     logger = JsonLogger(path=os.path.join(checkpoint_dir, "log.json"))
@@ -498,7 +538,8 @@ def main(config):
         train(model=hilbert_representation, 
             q_function=q_func, 
             v_function=v_func, 
-            policy=policy, 
+            policy=policy,
+            scaler=scaler,
             train_dataloader=train_dataloader,
             val_dataloader=val_dataloader,
             latent_dim=model_cfg.latent_dim,
@@ -513,4 +554,5 @@ def main(config):
     
 
 if __name__=="__main__":   
+    mp.set_start_method("spawn", force=True)
     main()

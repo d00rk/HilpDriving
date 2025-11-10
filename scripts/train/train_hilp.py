@@ -9,7 +9,7 @@ import wandb
 import datetime as dt
 import numpy as np
 import glob
-import tqdm
+from tqdm import tqdm
 import click
 from omegaconf import OmegaConf
 
@@ -24,57 +24,31 @@ from model.hilp import HilbertRepresentation
 from dataset.dataset import GoalDataset
 from utils.seed_utils import seed_all
 from utils.utils import l2_expectile_loss
-from utils.logger import JsonLogger
+from utils.logger import JsonLogger, _stats_dict
 from utils.multiprocessing import _worker_init_fn
 
 
-# Put this near the top of the file
-class CUDAPrefetcher:
-    """Asynchronously prefetch next batch to GPU using a separate CUDA stream."""
-    def __init__(self, loader, device):
-        self.loader = iter(loader)
-        self.stream = torch.cuda.Stream()
-        self.device = device
-        self.next_batch = None
-        self.preload()
-
-    def preload(self):
-        try:
-            batch = next(self.loader)
-        except StopIteration:
-            self.next_batch = None
-            return
-        with torch.cuda.stream(self.stream):
-            # unpack and move to GPU non-blocking
-            state, next_state, goal, is_goal_now = batch
-            self.next_batch = (
-                state.to(self.device, non_blocking=True).contiguous(memory_format=torch.channels_last),
-                next_state.to(self.device, non_blocking=True).contiguous(memory_format=torch.channels_last),
-                goal.to(self.device, non_blocking=True).contiguous(memory_format=torch.channels_last),
-                is_goal_now.to(self.device, non_blocking=True).float(),
-            )
-
-    def next(self):
-        torch.cuda.current_stream().wait_stream(self.stream)
-        batch = self.next_batch
-        self.preload()
-        return batch
-    
-    
-
-def eval_hilp(model, 
-              target_model, 
-              dataloader, 
-              epoch,
-              total_epoch,
-              gamma,
-              expectile_tau,
-              device):
+def eval(
+    model, 
+    target_model, 
+    dataloader, 
+    epoch,
+    total_epoch,
+    gamma,
+    expectile_tau,
+    device
+    ):
     model.eval()
     target_model.eval()
     
     total_loss = 0.0
-    pbar = tqdm.tqdm(enumerate(dataloader), total=len(dataloader), desc=f"[Validation] {epoch} / {total_epoch}", leave=True, ncols=100)
+    pbar = tqdm(
+        enumerate(dataloader), 
+        total=len(dataloader), 
+        desc=f"[Validation] {epoch}/{total_epoch}", 
+        leave=True, 
+        ncols=100
+        )
     with torch.inference_mode(), torch.cuda.amp.autocast():
         for i, (state, next_state, goal, is_goal_now) in pbar:
             state = state.to(device, non_blocking=True)
@@ -105,21 +79,23 @@ def eval_hilp(model,
     return avg_loss
 
 
-def train_hilp(model, 
-               target_model, 
-               train_dataloader, 
-               val_dataloader,
-               scaler,
-               wb,
-               ckpt,
-               checkpoint_dir,
-               cfg,
-               logger):
+def train(
+    model, 
+    target_model, 
+    train_dataloader, 
+    val_dataloader,
+    scaler,
+    wb,
+    ckpt,
+    checkpoint_dir,
+    cfg,
+    logger
+    ):
     
     model = model.to(cfg.device)
     target_model = target_model.to(cfg.device)
     
-    optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr)
     lr_scheduler = CosineAnnealingLR(optimizer, T_max=cfg.num_epochs*len(train_dataloader))
     
     if ckpt is not None:
@@ -136,13 +112,16 @@ def train_hilp(model,
     early_stop_counter = 0
     for epoch in range(cfg.num_epochs):
         total_loss = 0.0
-        progress_bar = tqdm.tqdm(enumerate(train_dataloader),
-                                 total=len(train_dataloader), 
-                                desc=f"[Train] Epoch {epoch}/{cfg.num_epochs}", 
-                                leave=True, ncols=100)
+        pbar = tqdm(
+            enumerate(train_dataloader),
+            total=len(train_dataloader), 
+            desc=f"[Train] Epoch {epoch}/{cfg.num_epochs}", 
+            leave=True, 
+            ncols=100
+            )
         model.train()
         
-        for i, (state, next_state, goal, is_goal_now) in progress_bar:
+        for i, (state, next_state, goal, is_goal_now) in pbar:
             state = state.to(cfg.device, non_blocking=True)
             next_state = next_state.to(cfg.device, non_blocking=True)
             goal =  goal.to(cfg.device, non_blocking=True)
@@ -185,14 +164,21 @@ def train_hilp(model,
                         target_param.data.mul_(1 - tau).add_(param.data, alpha=tau)
             
             total_loss += loss.item()
-            progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
+            pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
             
             if (i % cfg.log_frequency) == 0:
                 step_log = {"train/epoch": epoch,
                             "train/global_step": global_step,
                             "train/loss": loss.item(),
-                            "train/lr": lr_scheduler.get_last_lr()[0]
+                            "train/lr": lr_scheduler.get_last_lr()[0],
+                            "debug/temporal_dist_mean": float(temporal_dist.mean()),
+                            "debug/target_dist_mean": float(target_dist.mean()),
+                            "debug/delta_abs_mean": float(delta.abs().mean())
                             }
+                step_log.update(_stats_dict("debug/state", state))
+                step_log.update(_stats_dict("debug/next_state", next_state))
+                step_log.update(_stats_dict("debug/goal", goal))
+                step_log.update({"debug/has_nan_input": int(torch.isnan(state).any().item() or torch.isnan(next_state).any().item() or torch.isnan(goal).any().item())})
                 
                 logger.log(step_log)
                 if wb:
@@ -223,14 +209,14 @@ def train_hilp(model,
             wandb.log(step_log, step=global_step)
          
         if epoch % cfg.eval_frequency == 0:
-            eval_loss = eval_hilp(model=model, 
-                                  target_model=target_model, 
-                                  dataloader=val_dataloader, 
-                                  epoch=epoch,
-                                  total_epoch=cfg.num_epochs,
-                                  gamma=cfg.gamma,
-                                  expectile_tau=cfg.expectile_tau,
-                                  device=cfg.device)
+            eval_loss = eval(model=model, 
+                            target_model=target_model, 
+                            dataloader=val_dataloader, 
+                            epoch=epoch,
+                            total_epoch=cfg.num_epochs,
+                            gamma=cfg.gamma,
+                            expectile_tau=cfg.expectile_tau,
+                            device=cfg.device)
             
             print(f"[Validation] Loss: {eval_loss:.4f}")
             
@@ -341,17 +327,18 @@ def main(config):
         wandb.run.name = f"{cfg.wandb_name}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
     try:
-        train_hilp(model=model, 
-                target_model=target_model, 
-                train_dataloader=train_dataloader, 
-                val_dataloader=val_dataloader,
-                scaler=scaler,
-                ckpt=ckpt, 
-                wb=cfg.wb,
-                checkpoint_dir=checkpoint_dir,
-                cfg=train_cfg,
-                logger=logger,
-                )
+        train(
+            model=model, 
+            target_model=target_model, 
+            train_dataloader=train_dataloader, 
+            val_dataloader=val_dataloader,
+            scaler=scaler,
+            ckpt=ckpt, 
+            wb=cfg.wb,
+            checkpoint_dir=checkpoint_dir,
+            cfg=train_cfg,
+            logger=logger,
+            )
     finally:
         logger.stop()
 
