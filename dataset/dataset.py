@@ -7,8 +7,10 @@ import threading
 import glob
 import random
 import copy
+import time
+from collections import OrderedDict
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from torch.distributions import Normal
 from sklearn.cluster import KMeans
 import numpy as np
@@ -37,25 +39,24 @@ class TrajectoryDataset(Dataset):
         hdf5_paths = list()
         for town in cfg.data_town:
             for t in cfg.type:
-                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town.lower()}_{t.lower()}.hdf5'))
+                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town}/{t.lower()}/*.hdf5'))
                 hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
   
         for hdf5_path in hdf5_paths:
-            with h5py.File(hdf5_path, 'r') as f:
-                epi_keys = sorted([k for k in f.keys() if k.startswith("episode_")], 
-                                   key=lambda x: int(x.split("_")[1]))
-                for epi in epi_keys:
-                    data = f[epi]
-                    epi_length = data.attrs['episode_length']
-                    for i in range(epi_length):
-                        if i == (epi_length - 1):
-                            next_key = i
-                            terminal = True
-                        else:
-                            next_key = i+1
-                            terminal = False
-                        self.index_list.append((hdf5_path, epi, i, next_key, terminal)) 
+            file = h5py.File(hdf5_path, 'r')
+            epi = list(file.keys())[0]
+            data = file[epi]
+            epi_length = data.attrs['episode_length']
+            for i in range(epi_length):
+                if i == (epi_length - 1):
+                    next_key = i
+                    terminal = True
+                else:
+                    next_key = i+1
+                    terminal = False
+                self.index_list.append((hdf5_path, epi, i, next_key, terminal))
+            file.close()
     
     def __len__(self):
         return len(self.index_list)
@@ -68,7 +69,7 @@ class TrajectoryDataset(Dataset):
             f = self._file_cache.get(path)
             if f is None:
                 f = h5py.File(
-                    path, 'r', libver='latest', swmr=False, rdcc_nbytes=int(256*1024*1024), rdcc_nslots=1_000_003
+                    path, 'r', libver='latest', swmr=True, rdcc_nbytes=int(256*1024*1024), rdcc_nslots=1_000_003
                 )
                 self._file_cache[path] = f
         return f
@@ -112,89 +113,342 @@ class TrajectoryDataset(Dataset):
 
 # =============================================================================
 # GoalDataset: {(s, s', g)_0^T}
-# s: CHW float [0, 1] at timestep t
-# s': CHW float [0, 1] at timestep t+1
-# g: CHW float [0, 1] at timestpe t+H (H is random)
+# s: HWC uint8 image at timestep t
+# s': HWC uint8 image at timestep t+1
+# g: HWC uint8 image at timestpe t+H (H is random)
 # =============================================================================
 class GoalDataset(Dataset):
     def __init__(self, seed, cfg):
         seed_all(seed)
         self.seed = seed
         self.p = cfg.p
+        self.p_goal = cfg.p_goal
         self.val_ratio = cfg.val_ratio
         self.index_list = list()
+        self.cache_episode_birdview = bool(getattr(cfg, "cache_episode_birdview", False))
+        self.max_cached_episodes = int(getattr(cfg, "max_cached_episodes", 0))
         
         self._file_cache = None
         self._cache_lock = threading.Lock()
+        self._episode_cache = None
+        self._episode_buckets = {}
         
         hdf5_paths = list()
         for town in cfg.data_town:
             for t in cfg.type:
-                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town.lower()}_{t.lower()}.hdf5'))
+                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town}/{t.lower()}/*.hdf5'))
                 hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
         
         for hdf5_path in hdf5_paths:
-            with h5py.File(hdf5_path, 'r') as f:
-                epi_keys = sorted([k for k in f.keys() if k.startswith("episode_")], 
-                                   key=lambda x: int(x.split("_")[1]))
-                for epi in epi_keys:
-                    data = f[epi]
-                    epi_length = data.attrs['episode_length']
-                    for i in range(epi_length-1):
-                        current_step_key = i
-                        next_step_key = i+1
-                        
-                        step = 1
-                        max_future_step = (epi_length - 1) - i
-                        
-                        while True:
-                            if random.random() < self.p:
-                                break
-                            step += 1
-                            if step >= max_future_step:
-                                step = max_future_step
-                                break
-                        
-                        goal_step_key = i+step
-                        assert goal_step_key != current_step_key, "g == s should be avoided"
-                        
-                        is_goal_now = (current_step_key == goal_step_key)
-                        
-                        self.index_list.append(
-                            (hdf5_path, epi, current_step_key, next_step_key, goal_step_key, is_goal_now)
-                        )
+            file = h5py.File(hdf5_path, 'r')
+            epi = list(file.keys())[0]
+            data = file[epi]
+            epi_length = data.attrs['episode_length']
+            for i in range(epi_length):
+                current_step_key = i
+                
+                if i == (epi_length - 1):
+                    next_step_key = i
+                    goal_step_key = i
+                else:
+                    step = 1
+                    max_future_step = (epi_length - 1) - i
+                    next_step_key = min(i + 1, epi_length - 1)
+                    while True:
+                        if random.random() < self.p:
+                            break
+                        step += 1
+                        if step >= max_future_step:
+                            step = max_future_step
+                            break
+                    goal_step_key = min(i + step, epi_length- 1)
+                is_goal_now = (current_step_key == goal_step_key)
+                    
+                self.index_list.append(
+                    (hdf5_path, epi, current_step_key, next_step_key, goal_step_key, is_goal_now)
+                )
+            file.close()
+        self._rebuild_episode_buckets()
+
+    def _load_frame(self, data, idx):
+        """Read a single birdview frame as HWC uint8 tensor."""
+        frame = torch.from_numpy(data['birdview'][idx])
+        return frame
+
+    def _maybe_get_episode_tensor(self, file_path, epi_key):
+        """Optionally cache the entire birdview tensor for the episode."""
+        if not (self.cache_episode_birdview and self.max_cached_episodes > 0):
+            return None
+        self._ensure_handles()
+        if self._episode_cache is None:
+            self._episode_cache = OrderedDict()
+        cache_key = (file_path, epi_key)
+        with self._cache_lock:
+            cached = self._episode_cache.get(cache_key)
+            if cached is not None:
+                self._episode_cache.move_to_end(cache_key)
+                return cached
+        f = self._get_file(file_path)
+        data = f[epi_key]
+        frames = torch.from_numpy(data['birdview'][()])
+        with self._cache_lock:
+            self._episode_cache[cache_key] = frames
+            self._episode_cache.move_to_end(cache_key)
+            while len(self._episode_cache) > self.max_cached_episodes:
+                self._episode_cache.popitem(last=False)
+        return frames
+
+    def _rebuild_episode_buckets(self):
+        """Group sample indices by (file_path, episode) for sequential sampling."""
+        buckets = {}
+        for idx, (file_path, epi_key, *_rest) in enumerate(self.index_list):
+            buckets.setdefault((file_path, epi_key), []).append(idx)
+        self._episode_buckets = buckets
                     
     def __len__(self):
         return len(self.index_list)
     
-    def _get_file(self, path):
+    def __getstate__(self):
+        """Remove unpicklable members before pickling (for worker processes)."""
+        state = self.__dict__.copy()
+        state["_file_cache"] = None
+        state["_cache_lock"] = None
+        state["_episode_cache"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Recreate members after unpickling (inside each worker)."""
+        self.__dict__.update(state)
+        self._file_cache = None
+        self._cache_lock = None
+        self._episode_cache = None
+
+    def _ensure_handles(self):
+        """Lazily create per-process cache and lock."""
         if self._file_cache is None:
             self._file_cache = {}
+        if self._cache_lock is None:
+            self._cache_lock = threading.Lock()
+        if self.cache_episode_birdview and self._episode_cache is None:
+            self._episode_cache = OrderedDict()
+    
+    def _get_file(self, path):
+        self._ensure_handles()
         
         with self._cache_lock:
             f = self._file_cache.get(path)
             if f is None:
                 f = h5py.File(
-                    path, 'r', libver='latest', swmr=False, rdcc_nbytes=int(256*1024*1024), rdcc_nslots=1_000_003
+                    path, 'r', libver='latest', swmr=True, rdcc_nbytes=int(256*1024*1024), rdcc_nslots=1_000_003
                 )
                 self._file_cache[path] = f
         return f
     
     def __getitem__(self, index):
-        file_path, epi_key, current_key, next_key, goal_key, is_goal_now = self.index_list[index]
-        f = self._get_file(file_path)
 
-        d = f[epi_key]
-        current_obs =  torch.from_numpy(d['birdview'][current_key].astype('float32')) / 255.0
-        next_obs = torch.from_numpy(d['birdview'][next_key].astype('float32')) / 255.0
-        goal_obs = torch.from_numpy(d['birdview'][goal_key].astype('float32')) / 255.0
+        file_path, epi_key, current_key, next_key, goal_key, is_goal_now = self.index_list[index]
+        episode_tensor = self._maybe_get_episode_tensor(file_path, epi_key)
+
+        if episode_tensor is not None:
+            current_obs = episode_tensor[current_key]
+            next_obs = episode_tensor[next_key]
+            goal_obs = episode_tensor[goal_key]
+        else:
+            f = self._get_file(file_path)
+            d = f[epi_key]
             
-        current_obs = current_obs.permute(2, 0, 1).contiguous() 
-        next_obs = next_obs.permute(2, 0, 1).contiguous()
-        goal_obs = goal_obs.permute(2, 0, 1).contiguous()
+            current_obs = self._load_frame(d, current_key)
+            next_obs = self._load_frame(d, next_key)
+            goal_obs = self._load_frame(d, goal_key)
+        
+        is_goal_now = torch.tensor(is_goal_now, dtype=torch.float32)
         
         return (current_obs, next_obs, goal_obs, is_goal_now)
+    
+    def split_train_val(self):
+        val_mask = get_val_mask(len(self), self.val_ratio, self.seed)
+        train_idxs = [i for i, m in enumerate(val_mask) if not m]
+        val_idxs = [i for i, m in enumerate(val_mask) if m]
+        
+        train_dataset = copy.copy(self)
+        train_dataset.index_list = [self.index_list[i] for i in train_idxs]
+        train_dataset._rebuild_episode_buckets()
+        
+        val_dataset = copy.copy(self)
+        val_dataset.index_list = [self.index_list[i] for i in val_idxs]
+        val_dataset._rebuild_episode_buckets()
+        
+        return train_dataset, val_dataset
+    
+
+class EpisodeChunkSampler(Sampler):
+    """Sampler that keeps samples from the same episode contiguous to improve IO locality."""
+
+    def __init__(self, dataset, chunk_size=32, shuffle=True, seed=0):
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be > 0")
+        self.dataset = dataset
+        self.chunk_size = int(chunk_size)
+        self.shuffle = shuffle
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        if not getattr(self.dataset, "_episode_buckets", None):
+            self.dataset._rebuild_episode_buckets()
+        chunks = []
+        for indices in self.dataset._episode_buckets.values():
+            start = 0
+            while start < len(indices):
+                chunks.append(indices[start:start + self.chunk_size])
+                start += self.chunk_size
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            perm = torch.randperm(len(chunks), generator=g).tolist()
+            chunks = [chunks[i] for i in perm]
+        for chunk in chunks:
+            for idx in chunk:
+                yield idx
+
+    def __len__(self):
+        return len(self.dataset)
+    
+
+
+# =============================================================================
+# LatentGoalDataset: {(s, z, s', g, R, terminal)} (for OPAL, HsO-VP high-level)
+# s: CHW float [0, 1] at time t
+# z: skill latent summarizing the sub-trajectory
+# s': CHW float [0, 1] at time t+L (L is fixed)
+# g: CHW float [0, 1] goal image
+# R: discounted reward over the sub-trajectory
+# =============================================================================
+class LatentGoalDataset(Dataset):
+    def __init__(self, seed, gamma, encoder, cfg):
+        self.seed = seed
+        seed_all(self.seed)
+        
+        self.val_ratio = cfg.val_ratio
+        self.gamma = gamma
+        self.encoder = encoder
+        self.algo = cfg.algo
+        
+        self._file_cache = None
+        self._cache_lock = threading.Lock()
+        
+        self.index_list = list()
+        hdf5_paths = []
+        for town in cfg.data_town:
+            for t in cfg.type:
+                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town}/{t.lower()}/*.hdf5'))
+                hdf5_paths.extend(hp)
+        hdf5_paths = sorted(hdf5_paths)
+        
+        for hdf5_path in hdf5_paths:
+            file = h5py.File(hdf5_path, 'r')
+            epi = list(file.keys())[0]
+            data = file[epi]
+            epi_length = data.attrs['episode_length']
+            goal_idx = epi_length - 1
+            for i in range(epi_length - cfg.trajectory_length + 1):
+                next_idx = i + cfg.trajectory_length - 1
+                terminal = (next_idx == epi_length - 1)
+                self.index_list.append((hdf5_path, epi, i, next_idx, goal_idx, terminal))
+            file.close()
+        
+    def __len__(self):
+        return len(self.index_list)
+    
+    def __getstate__(self):
+        """Remove unpicklable members before pickling (for worker processes)."""
+        state = self.__dict__.copy()
+        state["_file_cache"] = None
+        state["_cache_lock"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Recreate members after unpickling (inside each worker)."""
+        self.__dict__.update(state)
+        self._file_cache = None
+        self._cache_lock = None
+
+    def _ensure_handles(self):
+        """Lazily create per-process cache and lock."""
+        if self._file_cache is None:
+            self._file_cache = {}
+        if self._cache_lock is None:
+            self._cache_lock = threading.Lock()
+    
+    def _get_file(self, path):
+        self._ensure_handles()
+        
+        with self._cache_lock:
+            f = self._file_cache.get(path)
+            if f is None:
+                f = h5py.File(
+                    path, 'r', libver='latest', swmr=True, rdcc_nbytes=int(256*1024*1024), rdcc_nslots=1_000_003
+                )
+                self._file_cache[path] = f
+        return f
+        
+    def __getitem__(self, index):
+        file_path, epi_key, start_idx, end_idx, goal_idx, terminal = self.index_list[index]
+        f = self._get_file(file_path)
+        
+        data = f[epi_key]
+        current_obs = torch.from_numpy(data['birdview'][start_idx].astype('float32')) / 255.0
+        end_obs = torch.from_numpy(data['birdview'][end_idx].astype('float32')) / 255.0
+        goal_obs = torch.from_numpy(data['birdview'][goal_idx].astype('float32')) / 255.0
+        current_obs = current_obs.permute(2, 0, 1).contiguous()
+        end_obs = end_obs.permute(2, 0, 1).contiguous()
+        goal_obs = goal_obs.permute(2, 0, 1).contiguous()
+        
+        if self.algo == "hilp":
+            with torch.no_grad():
+                z = self.encoder(current_obs.unsqueeze(0))
+                z_goal = self.encoder(end_obs.unsqueeze(0))
+                vec = z_goal - z
+                norm = torch.norm(vec)
+                z = vec / (norm + 1e-6)
+                z = z.squeeze(0)
+            R = 0.0
+            for j in range(start_idx, end_idx):
+                r_j = float(data['reward']['r_sum'][j])
+                R += (self.gamma ** (j - start_idx)) * r_j
+        else:
+            s_seq, a_seq, r_seq = [], [], []
+            for j in range(start_idx, end_idx):
+                s = torch.from_numpy(data['birdview'][j].astype('float32')) / 255.0
+                s = s.permute(2, 0, 1).contiguous()
+                s_seq.append(s)
+                
+                steer = float(data['measurements']['steer'][j])
+                throttle = float(data['measurements']['throttle'][j])
+                brake = float(data['measurements']['brake'][j])
+                a_seq.append(torch.tensor([steer, throttle, brake], dtype=torch.float32))
+                
+                r_j = float(data['reward']['r_sum'][j])
+                r_seq.append(r_j)
+
+            s_seq = torch.stack(s_seq, dim=0).unsqueeze(0).contiguous()
+            a_seq = torch.stack(a_seq, dim=0).unsqueeze(0).contiguous()
+            
+            with torch.no_grad():
+                z = self.encoder(s_seq, a_seq)
+                if z.ndim == 2:
+                    z = z[0]
+            
+            R = 0.0
+            for t, r in enumerate(r_seq):
+                R += (self.gamma ** t) * r
+
+        return (current_obs, z, end_obs, goal_obs, torch.tensor([R], dtype=torch.float32), torch.tensor([terminal], dtype=torch.float32), torch.tensor([False], dtype=torch.float32))
+         
     
     def split_train_val(self):
         val_mask = get_val_mask(len(self), self.val_ratio, self.seed)
@@ -208,11 +462,10 @@ class GoalDataset(Dataset):
         val_dataset.index_list = [self.index_list[i] for i in val_idxs]
         
         return train_dataset, val_dataset
-    
 
 
 # =============================================================================
-# LatentDataset: {(s, z, s', R, terminal)} (for OPAL, HsO-VP high-level)
+# LatentDataset: {(s, z, s', g, R, terminal)} (for OPAL, HsO-VP high-level)
 # s: CHW float [0, 1] at time t
 # z: skill latent summarizing the sub-trajectory
 # s': CHW float [0, 1] at time t+L (L is fixed)
@@ -235,21 +488,20 @@ class LatentDataset(Dataset):
         hdf5_paths = []
         for town in cfg.data_town:
             for t in cfg.type:
-                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town.lower()}_{t.lower()}.hdf5'))
+                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town}/{t.lower()}/*.hdf5'))
                 hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
         
         for hdf5_path in hdf5_paths:
-            with h5py.File(hdf5_path, 'r') as f:
-                epi_keys = sorted([k for k in f.keys() if k.startswith("episode_")], key=lambda x: int(x.split("_")[1]))
-                
-                for epi in epi_keys:
-                    data = f[epi]
-                    epi_length = data.attrs['episode_length']
-                    for i in range(epi_length - cfg.trajectory_length + 1):
-                        next_idx = i + cfg.trajectory_length - 1
-                        terminal = (next_idx == epi_length - 1)
-                        self.index_list.append((hdf5_path, epi, i, next_idx, terminal))
+            file = h5py.File(hdf5_path, 'r')
+            epi = list(file.keys())[0]
+            data = file[epi]
+            epi_length = data.attrs['episode_length']
+            for i in range(epi_length - cfg.trajectory_length + 1):
+                next_idx = i + cfg.trajectory_length - 1
+                terminal = (next_idx == epi_length - 1)
+                self.index_list.append((hdf5_path, epi, i, next_idx, terminal))
+            file.close()
         
     def __len__(self):
         return len(self.index_list)
@@ -260,9 +512,9 @@ class LatentDataset(Dataset):
         
         with self._cache_lock:
             f = self._file_cache.get(path)
-            if f in None:
+            if f is None:
                 f = h5py.File(
-                    path, 'r', libver='latest', swmr=False, rdcc_nbytes=int(256*1024*1024), rdcc_nslots=1_000_003
+                    path, 'r', libver='latest', swmr=True, rdcc_nbytes=int(256*1024*1024), rdcc_nslots=1_000_003
                 )
                 self._file_cache[path] = f
         return f
@@ -353,22 +605,21 @@ class SubTrajDataset(Dataset):
         hdf5_paths = list()
         for town in cfg.data_town:
             for t in cfg.type:
-                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town.lower()}_{t.lower()}.hdf5'))
+                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town}/{t.lower()}/*.hdf5'))
                 hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
 
         for hdf5_path in hdf5_paths:
-            with h5py.File(hdf5_path, 'r') as f:
-                epi_keys = sorted([k for k in f.keys() if k.startswith("episode_")],
-                                   key=lambda x: int(x.split("_")[1]))
-                for epi in epi_keys:
-                    data = f[epi]
-                    epi_length = data.attrs['episode_length']
-                    last_start = epi_length - (self.length + 1)
-                    if last_start < 0:
-                        continue
-                    for i in range(last_start+1):
-                        self.index_list.append((hdf5_path, epi, i))
+            file = h5py.File(hdf5_path, 'r')
+            epi = list(file.keys())[0]
+            data = file[epi]
+            epi_length = data.attrs['episode_length']
+            last_start = epi_length - (self.length + 1)
+            if last_start < 0:
+                continue
+            for i in range(last_start+1):
+                self.index_list.append((hdf5_path, epi, i))
+            file.close()
         
     def __len__(self):
         return len(self.index_list)
@@ -379,9 +630,9 @@ class SubTrajDataset(Dataset):
         
         with self._cache_lock:
             f = self._file_cache.get(path)
-            if f in None:
+            if f is None:
                 f = h5py.File(
-                    path, 'r', libver='latest', swmr=False, rdcc_nbytes=int(256*1024*1024), rdcc_nslots=1_000_003
+                    path, 'r', libver='latest', swmr=True, rdcc_nbytes=int(256*1024*1024), rdcc_nslots=1_000_003
                 )
                 self._file_cache[path] = f
         return f
@@ -392,41 +643,46 @@ class SubTrajDataset(Dataset):
 
         f = self._get_file(file_path)
         data = f[epi_idx]
-
+        
         states, actions, next_states = [], [], []
         rewards, terminals, timeouts = [], [], []
-        for t in range(start_idx, start_idx+L):
-            t_next = t + 1
-            
-            s = torch.from_numpy(data['birdview'][t].astype('float32')) / 255.0
-            s_next = torch.from_numpy(data['birdview'][t_next].astype('float32')) / 255.0
-            s = s.permute(2, 0, 1).contiguous()
-            s_next = s_next.permute(2, 0, 1).contiguous()
-            
-            steer = float(data['measurements']['steer'][t])
-            throttle = float(data['measurements']['throttle'][t])
-            brake = float(data['measurements']['brake'][t])
-            a = torch.tensor([steer, throttle, brake], dtype=torch.float32)
-            
-            reward = float(data['reward']['r_sum'][t])
-            
-            is_terminal = float(t == (int(data.attrs['episode_length'])-1))
-            
-            states.append(s)
-            actions.append(a)
-            next_states.append(s_next)
-            rewards.append(torch.tensor(reward, dtype=torch.float32))
-            terminals.append(torch.tensor(is_terminal, dtype=torch.float32))
-            timeouts.append(torch.tensor(0.0, dtype=torch.float32))
-                
-        states = torch.stack(states, dim=0)
-        actions = torch.stack(actions, dim=0)
-        next_states = torch.stack(next_states, dim=0)
-        rewards = torch.stack(rewards, dim=0)
-        terminals = torch.stack(terminals, dim=0)
-        timeouts = torch.stack(timeouts, dim=0)
+        
+        frames = data['birdview'][start_idx:start_idx+L+1]
+        frames = torch.from_numpy(frames.astype('float32')) / 255.0
+        frames = frames.permute(0, 3, 1, 2).contiguous()
+        states = frames[:-1]
+        next_states = frames[1:]
+        
+        meas = data['measurements']
+        steer = np.asarray(meas['steer'][start_idx:start_idx+L], dtype=np.float32)
+        throttle = np.asarray(meas['throttle'][start_idx:start_idx+L], dtype=np.float32)
+        brake = np.asarray(meas['brake'][start_idx:start_idx+L], dtype=np.float32)
+        actions = torch.from_numpy(np.stack([steer, throttle, brake], axis=1))
+        
+        rewards = np.asarray(data['reward']['r_sum'][start_idx:start_idx+L], dtype=np.float32)
+        rewards = torch.from_numpy(rewards)
+        
+        epi_last = int(data.attrs['episode_length']) - 1
+        t_idx = np.arange(start_idx, start_idx+L, dtype=np.int64)
+        terminals = torch.from_numpy((t_idx == epi_last).astype(np.float32))
+        timeouts = torch.zeros(L, dtype=torch.float32)
         
         return (states, actions, next_states, rewards, terminals, timeouts)
+    
+    def __getstate__(self):
+        """Make the dataset picklable for DataLoader workers (spawn)."""
+        state = self.__dict__.copy()
+        # Drop unpicklable / process-local resources
+        state["_cache_lock"] = None
+        state["_file_cache"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Recreate process-local resources after unpickling in each worker."""
+        self.__dict__.update(state)
+        import threading
+        self._cache_lock = threading.Lock()
+        self._file_cache = None  # let each worker lazily reopen HDF5 files
     
     def split_train_val(self):
         val_mask = get_val_mask(len(self), self.val_ratio, self.seed)
@@ -491,7 +747,7 @@ class FilteredDataset(Dataset):
         hdf5_paths = list()
         for town in cfg.data_town:
             for t in cfg.type:
-                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town.lower()}_{t.lower()}.hdf5'))
+                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town}/{t.lower()}/*.hdf5'))
                 hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
         
@@ -499,27 +755,26 @@ class FilteredDataset(Dataset):
         action_feature_list = list()
         
         for hdf5_path in hdf5_paths:
-            with h5py.File(hdf5_path, 'r') as f:
-                episode_keys = sorted([k for k in f.keys() if k.startswith("episode_")],
-                                   key=lambda x: int(x.split("_")[1]))
-                for epi in episode_keys:
-                    data = f[epi]
-                    epi_length = data.attrs['episode_length']
-                    last_sequence_start = epi_length - (self.length + 1)
-                    for i in range(last_sequence_start + 1):
-                        end_idx = i + self.length
-                        terminal = (end_idx == (epi_length - 1))
-                        self.index_list.append((hdf5_path, epi, i, end_idx, terminal))
-                        
-                        actions = list()
-                        for j in range(i, end_idx):
-                            steer = data['measurements']['steer'][j]
-                            throttle = data['measurements']['throttle'][j]
-                            brake = data['measurements']['brake'][j]
-                            action = np.array([steer, throttle, brake], dtype=np.float32)
-                            actions.append(action)
-                        concat_action = np.concatenate(actions, axis=0)
-                        action_feature_list.append(concat_action)
+            file = h5py.File(hdf5_path, 'r')
+            epi = list(file.keys())[0]
+            data = f[epi]
+            epi_length = data.attrs['episode_length']
+            last_sequence_start = epi_length - (self.length + 1)
+            for i in range(last_sequence_start + 1):
+                end_idx = i + self.length
+                terminal = (end_idx == (epi_length - 1))
+                self.index_list.append((hdf5_path, epi, i, end_idx, terminal))
+                
+                actions = list()
+                for j in range(i, end_idx):
+                    steer = data['measurements']['steer'][j]
+                    throttle = data['measurements']['throttle'][j]
+                    brake = data['measurements']['brake'][j]
+                    action = np.array([steer, throttle, brake], dtype=np.float32)
+                    actions.append(action)
+                concat_action = np.concatenate(actions, axis=0)
+                action_feature_list.append(concat_action)
+            file.close()
         self.action_features = np.asarray(action_feature_list)
         
         self.num_cluster = cfg.discrete_option if hasattr(cfg, "discrete_option") else 6
@@ -581,7 +836,7 @@ class FilteredDataset(Dataset):
             f = self._file_cache.get(path)
             if f is None:
                 f = h5py.File(
-                    path, 'r', libver='latest', swmr=False, rdcc_nbytes=int(256*1024*1024), rdcc_nslots=1_000_003
+                    path, 'r', libver='latest', swmr=True, rdcc_nbytes=int(256*1024*1024), rdcc_nslots=1_000_003
                 )
                 self._file_cache[path] = f
         return f

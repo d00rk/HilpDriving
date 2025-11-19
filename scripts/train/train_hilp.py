@@ -3,7 +3,7 @@ Training Hilbert Representation Model phi(s)
 """
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import wandb
 import datetime as dt
@@ -14,6 +14,7 @@ import click
 from omegaconf import OmegaConf
 
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -23,9 +24,8 @@ import torch.multiprocessing as mp
 from model.hilp import HilbertRepresentation
 from dataset.dataset import GoalDataset
 from utils.seed_utils import seed_all
-from utils.utils import l2_expectile_loss
+from utils.utils import ensure_chw, l2_expectile_loss, update_exponential_moving_average
 from utils.logger import JsonLogger, _stats_dict
-from utils.multiprocessing import _worker_init_fn
 
 
 def eval(
@@ -33,10 +33,7 @@ def eval(
     target_model, 
     dataloader, 
     epoch,
-    total_epoch,
-    gamma,
-    expectile_tau,
-    device
+    cfg
     ):
     model.eval()
     target_model.eval()
@@ -45,16 +42,20 @@ def eval(
     pbar = tqdm(
         enumerate(dataloader), 
         total=len(dataloader), 
-        desc=f"[Validation] {epoch}/{total_epoch}", 
+        desc=f"[Validation] {epoch}/{cfg.num_epochs}", 
         leave=True, 
         ncols=100
         )
-    with torch.inference_mode(), torch.cuda.amp.autocast():
+    with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=cfg.use_amp):
         for i, (state, next_state, goal, is_goal_now) in pbar:
-            state = state.to(device, non_blocking=True)
-            next_state = next_state.to(device, non_blocking=True)
-            goal = goal.to(device, non_blocking=True)
-            is_goal_now = is_goal_now.to(device, non_blocking=True).float()
+            state = state.to(cfg.device, non_blocking=True)
+            next_state = next_state.to(cfg.device, non_blocking=True)
+            goal = goal.to(cfg.device, non_blocking=True)
+            is_goal_now = is_goal_now.to(cfg.device, non_blocking=True).float()
+            
+            state = ensure_chw(state)
+            next_state = ensure_chw(next_state)
+            goal = ensure_chw(goal)
             
             B, C, H, W = state.shape
 
@@ -68,11 +69,12 @@ def eval(
             phi_next_s, phi_next_g = phi_next[:B], phi_next[B:]
             
             temporal_dist = torch.norm(phi_s - phi_g, dim=-1)       # (B, )
-            reward = -1.0 * (1.0 - is_goal_now)
-            target_dist = gamma * torch.norm(phi_next_s - phi_next_g, dim=-1)
+            mask = (1.0 - is_goal_now)
+            reward = -1.0 * mask
+            target_dist = cfg.gamma * mask * torch.norm(phi_next_s - phi_next_g, dim=-1)
             delta = reward - target_dist + temporal_dist
 
-            loss = l2_expectile_loss(delta, expectile_tau)
+            loss = l2_expectile_loss(delta, cfg.expectile_tau)
             total_loss += loss.item()
         
         avg_loss = total_loss / len(dataloader)
@@ -95,7 +97,7 @@ def train(
     model = model.to(cfg.device)
     target_model = target_model.to(cfg.device)
     
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     lr_scheduler = CosineAnnealingLR(optimizer, T_max=cfg.num_epochs*len(train_dataloader))
     
     if ckpt is not None:
@@ -111,6 +113,9 @@ def train(
     global_step = 0
     early_stop_counter = 0
     for epoch in range(cfg.num_epochs):
+        sampler = getattr(train_dataloader, "sampler", None)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
         total_loss = 0.0
         pbar = tqdm(
             enumerate(train_dataloader),
@@ -127,41 +132,44 @@ def train(
             goal =  goal.to(cfg.device, non_blocking=True)
             is_goal_now = is_goal_now.to(cfg.device, non_blocking=True).float()
             
+            state = ensure_chw(state)
+            next_state = ensure_chw(next_state)
+            goal = ensure_chw(goal)
+            
             B, C, H, W = state.shape
             
             optimizer.zero_grad()
             
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type='cuda', enabled=cfg.use_amp):
                 # phi(s), phi(g)
                 sg = torch.cat([state, goal], dim=0)
                 phi = model(sg)
                 phi_s, phi_g = phi[:B], phi[B:]
                 
-                with torch.inference_mode():
+                with torch.no_grad():
+                    # target_phi(s'), target_phi(g)
                     ng = torch.cat([next_state, goal], dim=0)
                     phi_next = target_model(ng)
-                    # target_phi(s'), target_phi(g)
                     target_phi_next_s, target_phi_g = phi_next[:B], phi_next[B:]
                 
                 temporal_dist = torch.norm(phi_s - phi_g, dim=-1)       # (B, )
                 
-                reward = -1.0 * (1.0 - is_goal_now)
+                mask = (1.0 - is_goal_now)
+                reward = -1.0 * mask
                 
-                target_dist = cfg.gamma * torch.norm(target_phi_next_s - target_phi_g, dim=-1)
+                target_dist = cfg.gamma * mask * torch.norm(target_phi_next_s - target_phi_g, dim=-1)
                 delta = reward - target_dist + temporal_dist
                 
                 loss = l2_expectile_loss(delta, cfg.expectile_tau)
             
             scaler.scale(loss).backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optimizer)
             lr_scheduler.step()
             scaler.update()
 
             if (i % cfg.target_update_frequency) == 0:
-                with torch.no_grad():
-                    tau = cfg.tau
-                    for param, target_param in zip(model.parameters(), target_model.parameters()):
-                        target_param.data.mul_(1 - tau).add_(param.data, alpha=tau)
+                update_exponential_moving_average(target_model, model, cfg.tau)
             
             total_loss += loss.item()
             pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
@@ -213,10 +221,8 @@ def train(
                             target_model=target_model, 
                             dataloader=val_dataloader, 
                             epoch=epoch,
-                            total_epoch=cfg.num_epochs,
-                            gamma=cfg.gamma,
-                            expectile_tau=cfg.expectile_tau,
-                            device=cfg.device)
+                            cfg=cfg,
+                            )
             
             print(f"[Validation] Loss: {eval_loss:.4f}")
             
@@ -280,7 +286,7 @@ def main(config):
     for p in target_model.parameters():
         p.requires_grad_(False)
     
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    scaler = torch.amp.GradScaler(enabled=train_cfg.use_amp)
     
     ckpt = None
     if cfg.resume:
@@ -292,27 +298,20 @@ def main(config):
         
     dataset = GoalDataset(train_cfg.seed, data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
-    
     train_dataloader = DataLoader(
         train_dataset, 
-        batch_size=data_cfg.train_batch_size, 
-        shuffle=True, 
+        batch_size=data_cfg.train_batch_size,
+        shuffle=True,
         num_workers=data_cfg.num_workers,
-        pin_memory=data_cfg.pin_memory,
-        pin_memory_device=train_cfg.device,
-        persistent_workers=(data_cfg.num_workers>0),
-        worker_init_fn=_worker_init_fn,
-        )
+        pin_memory=data_cfg.pin_memory
+    )
     val_dataloader = DataLoader(
-        val_dataset, 
-        batch_size=data_cfg.val_batch_size, 
-        shuffle=False, 
-        num_workers=data_cfg.num_workers, 
-        pin_memory=data_cfg.pin_memory,
-        pin_memory_device=train_cfg.device,
-        persistent_workers=(data_cfg.num_workers>0),
-        worker_init_fn=_worker_init_fn,
-        )
+        val_dataset,
+        batch_size=data_cfg.val_batch_size,
+        shuffle=False,
+        num_workers=data_cfg.num_workers,
+        pin_memory=data_cfg.pin_memory
+    )
     
     checkpoint_dir = os.path.join(os.getcwd(), f"data/outputs/hilp/{dt.datetime.now().strftime('%Y_%m_%d')}/{dt.datetime.now().strftime('%H_%M_%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)

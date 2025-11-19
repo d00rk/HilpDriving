@@ -3,10 +3,38 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 
 import xml.etree.ElementTree as ET
+import math
 import torch
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 
+
+@torch.no_grad()
+def compute_z(hilbert, state, goal, eps=1e-8):
+    phi_s = hilbert(state)
+    phi_g = hilbert(goal)
+    vec = phi_g - phi_s
+    z = vec / (vec.norm(dim=-1, keepdim=True) + eps)
+    return z
+
+def cosine_align_loss(mu, z, eps=1e-8):
+    mu = mu / (mu.norm(dim=-1, keepdim=True) + eps)
+    z = z / (z.norm(dim=-1, keepdim=True) + eps)
+    return (1.0 - (mu * z).sum(dim=-1)).mean()
+
+def get_lambda(cfg, epoch):
+    base = cfg.get('lambda_align', 0.0)
+    schedule = cfg.get('aling_schedule', 'cosine')
+    if base <= 0.0:
+        return 0.0
+    if schedule == 'cosine':
+        return float(base * 0.5 * (1.0 + math.cos(math.pi * epoch / max(1, cfg.num_epochs))))
+    elif schedule == 'constant':
+        return float(base)
+    else:
+        return float(base)
+    
 def kl_divergence(mu1, logstd1, mu2, logstd2):
     kl = 0.5 * (logstd2 - logstd1 + (torch.exp(logstd1) + (mu1 - mu2).pow(2)) / torch.exp(logstd2) - 1)
     return kl.sum()
@@ -15,13 +43,15 @@ def asymmetric_l2_loss(u, tau):
     return torch.mean(torch.abs(tau - (u < 0).float()) * u**2)
 
 def l2_expectile_loss(x, tau):
-    weight = torch.where(x < 0, 1.0-float(tau), float(tau))
+    tau_t = torch.as_tensor(tau, dtype=x.dtype, device=x.device)
+    weight = torch.where(x < 0, 1.0-tau_t, tau_t)
     return torch.mean(weight * (x ** 2))
 
-def update_exponential_moving_average(target, source, alpha):
+def update_exponential_moving_average(target, online, alpha):
+    online_ref = online.module if isinstance(online, DDP) else online
     with torch.no_grad():
-        for target_param, source_param in zip(target.parameters(), source.parameters()):
-            target_param.data.mul_(1. - alpha).add_(source_param.data, alpha=alpha)
+        for target_param, source_param in zip(target.parameters(), online_ref.parameters()):
+            target_param.data.mul_(1.0 - alpha).add_(source_param.data, alpha=alpha)
         
 def log_sum_exp(tensor, dim=1, keepdim=False):
     m, _ = torch.max(tensor, dim=dim, keepdim=True)
@@ -160,3 +190,14 @@ def kl_diag_gaussians_logvar(mu_q, logvar_q, mu_p, logvar_p):
     # KL for diagonal Gaussians
     kl = 0.5 * ( (logvar_p - logvar_q) + (var_q + (mu_q - mu_p)**2) / var_p - 1.0 )
     return kl.sum(dim=-1)  # sum over latent dims
+
+def ensure_chw(img):
+    if img.dtype == torch.uint8:
+        if img.dim() == 4 and img.shape[-1] in (1, 3, 4):  # HWC -> CHW
+            img = img.permute(0, 3, 1, 2).contiguous()
+            img = img.to(torch.float32).div_(255.0)
+        return img
+    
+    if img.dim() == 4 and img.shape[1] not in (1, 3, 4) and img.shape[-1] in (1, 3, 4):
+        img = img.permute(0, 3, 1, 2).contiguous()
+    return img

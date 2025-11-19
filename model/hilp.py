@@ -32,7 +32,9 @@ class HilbertRepresentation(nn.Module):
         )
     
     def forward(self, x):
-        return self.feature_extractor(x)
+        x = self.feature_extractor(x)
+        x = x / (x.norm(dim=-1, keepdim=True) + 1e-8)
+        return x
     
     def initialize(self):
         self.apply(initialize_weights)

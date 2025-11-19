@@ -1,36 +1,38 @@
 data:
-    data_town: ["Town01", "Town02", "Town03", "Town04", "Town05", "Town06", "Town10"]
-    type: ["long", "short"]
+    data_town: ["Town01", "Town04", "Town06"]
+    type: ["short"]
     p: 0.2
-    num_workers: 0
-    train_batch_size: 512
-    val_batch_size: 512
+    p_goal: 0.0
+    train_batch_size: 256
+    val_batch_size: 256
     val_ratio: 0.2
     length: 10
+    num_workers: 2
+    prefetch_factor: 1
+    pin_memory: true
 
 model:
-    obs_dim: 192
-    action_dim: 2
     latent_dim: 10
-    latent_as_action: false
 
 train:
     device: "cuda:0"
+    use_amp: true
     seed: 42
-    num_epochs: 1000
-    eval_frequency: 10
-    target_update_frequency: 5
-    lr: 0.001
+    num_epochs: 100
+    eval_frequency: 5      # in epoch
+    log_frequency: 100       # in steps
+    target_update_frequency: 1
+    lr: 3e-5
+    weight_decay: 1e-4
     tau: 0.05
     expectile_tau: 0.7
     epsilon: 1e-6
-    gamma: 0.99
+    gamma: 0.95
     patience: 20
 
 resume: false
 resume_ckpt_dir: null
-verbose: true
 wb: true
 wandb_project: "hilbert"
 wandb_name: "hilbert-representation"
-wandb_tag: ["mine", "hilbert-representation", "leaderboard1", "Town01", "Town03", "Town04", "Town06"]
+wandb_tag: ["hilbert-representation"]
