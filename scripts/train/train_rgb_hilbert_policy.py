@@ -1,5 +1,6 @@
 """
-Training Hilbert Foundation Policy (Low-Level Policy) pi(a|s, z) with pretrained hilbert representation model.
+Training Hilbert Foundation Policy (Low-Level Policy) pi(a|s, z) 
+with pretrained view-aware hilbert representation model.
 """
 import sys
 import os
@@ -22,10 +23,10 @@ from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 from torch.distributions import Normal
 
-from model.hilp import HilbertRepresentation
-from model.value_function import TwinQforHilbert, ValueFunctionforHilbert
-from model.policy import ConditionedGaussianPolicy
-from dataset.dataset import SubTrajDataset
+from model.hilp import ViewAwareHilbertRepresentation
+from model.value_function import MLPTwinQforHilbert, MLPValueFunctionforHilbert
+from model.policy import MLPConditionedGaussianPolicy
+from dataset.rgb_dataset import SubTrajRGBDataset
 from utils.utils import asymmetric_l2_loss, update_exponential_moving_average, ensure_chw
 from utils.seed_utils import seed_all
 from utils.sampler import sample_latent_vectors
@@ -46,8 +47,6 @@ def eval(
     epoch,
     cfg
     ):
-    torch.cuda.empty_cache()
-    
     q_function.eval()
     policy.eval()
     v_function.eval()
@@ -67,43 +66,47 @@ def eval(
         total_v_loss = 0.0
         total_policy_loss = 0.0
         for i, (state, action, next_state, _, terminal, _) in pbar:
-            state = state.to(cfg.device, non_blocking=True)
-            action = action.to(cfg.device, non_blocking=True) 
-            next_state = next_state.to(cfg.device, non_blocking=True) 
+            for k, v in state.items():
+                v = v.to(cfg.device, non_blocking=True)
+                v = ensure_chw(v)
+                state[k] = v
+            
+            for k, v in next_state.items():
+                v = v.to(cfg.device, non_blocking=True)
+                v = ensure_chw(v)
+                next_state[k] = v
+                
+            action = action.to(cfg.device, non_blocking=True)  
             terminal = terminal.to(cfg.device, non_blocking=True)
             
-            state = state[:, :-1]  # align state sequence length with actions/next_state
-            state = ensure_chw(state)
-            next_state = ensure_chw(next_state)
+            B, S = action.shape[:2]
             
-            B, L, C, H, W = state.shape
-            B, S, A = action.shape
+            state_flat = {k: v.view(-1, *v.shape[2:]) for k, v in state.items()}
+            next_state_flat = {k: v.view(-1, *v.shape[2:]) for k, v in next_state.items()}
             
-            z = sample_latent_vectors(batch_size=B, latent_dim=latent_dim)
-            z_expand = z.unsqueeze(1).expand(B, S, latent_dim).contiguous().view(B*S, latent_dim)
-            z_expand = z_expand.to(cfg.device)
+            phi_s, _ = model(state)
+            phi_next_s, _ = model(next_state)
             
-            state = state.view(B*S, C, H, W)
             action = action.view(B*S, -1)
-            next_state = next_state.view(B*S, C, H, W)
             terminal = terminal.view(B*S)
             
-            phi_s = F.normalize(model(state), dim=-1)
-            phi_next_s = F.normalize(model(next_state), dim=-1)
-            intrinsic_reward = ((phi_next_s - phi_s) * z_expand).sum(dim=-1)
+            z = sample_latent_vectors(batch_size=B*S, latent_dim=latent_dim).to(cfg.device)
             
-            q_target = target_q_function(state, z_expand, action)
-            next_v = v_function(next_state, z_expand)
-            v = v_function(state, z_expand)
+            dist = phi_next_s - phi_s
+            intrinsic_reward = (dist * z).sum(dim=-1)
+            
+            q_target = target_q_function(phi_s, z, action)
+            next_v = v_function(phi_next_s, z)
+            v = v_function(phi_s, z)
             adv = q_target - v
             v_loss = asymmetric_l2_loss(adv, cfg.tau)
             
             targets = intrinsic_reward + cfg.skill_discount * (1.0 - terminal) * next_v.detach()
-            q1, q2 = q_function.both(state, z_expand, action)
+            q1, q2 = q_function.both(phi_s, z, action)
             q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
             
             exp_adv = torch.exp(cfg.skill_temperature * adv.detach()).clamp(max=EXP_ADV_MAX)
-            a_mu, a_logstd = policy(state, z_expand)
+            a_mu, a_logstd = policy(phi_s, z)
             dist = Normal(a_mu, a_logstd.exp())
             log_prob = dist.log_prob(action).sum(dim=-1)
             policy_loss = -(exp_adv * log_prob).mean()
@@ -193,38 +196,39 @@ def train(
         total_loss = 0.0
         
         for i, (state, action, next_state, _, terminal, _) in pbar:
-            state = state.to(cfg.device, non_blocking=True)
+            for k, v in state.items():
+                v = v.to(cfg.device, non_blocking=True)
+                v = ensure_chw(v)
+                state[k] = v
+            for k, v in next_state.items():
+                v = v.to(cfg.device, non_blocking=True)
+                v = ensure_chw(v)
+                next_state[k] = v
+            
             action = action.to(cfg.device, non_blocking=True) 
-            next_state = next_state.to(cfg.device, non_blocking=True) 
             terminal = terminal.to(cfg.device, non_blocking=True)
             
-            state = state[:, :-1]  # align state sequence length with actions/next_state
-            state = ensure_chw(state)
-            next_state = ensure_chw(next_state)
-            
-            B, S, C, H, W = state.shape
-            B, S, A = action.shape
-            
-            z = sample_latent_vectors(batch_size=B, latent_dim=latent_dim)
-            z_expand = z.unsqueeze(1).expand(B, S, latent_dim).contiguous().view(B*S, latent_dim)
-            z_expand = z_expand.to(cfg.device)
-            
-            state = state.view(B*S, C, H, W)
+            B, S = action.shape[2:]
             action = action.view(B*S, -1)
-            next_state = next_state.view(B*S, C, H, W)
             terminal = terminal.view(B*S)
             
+            state_flat = {k: v.view(-1, *v.shape[2:]) for k, v in state.items()}
+            next_state_flat = {k: v.view(-1, *v.shape[2:]) for k, v in next_state.items()}
+            
             with torch.no_grad():
-                phi_s = model(state)
-                phi_next_s = model(next_state)
+                phi_s, _ = model(state_flat)
+                phi_next_s, _ = model(next_state_flat)
+            
+            z = sample_latent_vectors(batch_size=B, latent_dim=latent_dim)
+            
             dist = phi_next_s - phi_s
-            intrinsic_reward = (dist * z_expand).sum(dim=-1)
+            intrinsic_reward = (dist * z).sum(dim=-1)
 
             with torch.amp.autocast(device_type=device_type, enabled=cfg.use_amp):
                 with torch.no_grad():
-                    q_target = target_q_function(state, z_expand, action)
-                    next_v = v_function(next_state, z_expand)
-                v = v_function(state, z_expand)
+                    q_target = target_q_function(phi_s, z, action)
+                    next_v = v_function(phi_next_s, z)
+                v = v_function(phi_s, z)
                 adv = q_target - v
                 v_loss = asymmetric_l2_loss(adv, cfg.tau)
             
@@ -235,19 +239,19 @@ def train(
             
             with torch.amp.autocast(device_type=device_type, enabled=cfg.use_amp):
                 targets = intrinsic_reward + cfg.skill_discount * (1.0 - terminal) * next_v.detach()
-                q1, q2 = q_function.both(state, z_expand, action)
+                q1, q2 = q_function.both(phi_s, z, action)
                 q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
             q_optimizer.zero_grad(set_to_none=True)
             scaler.scale(q_loss).backward()
             nn.utils.clip_grad_norm_(q_function.parameters(), max_norm=5.0)
             scaler.step(q_optimizer)
             
-            if ( i % cfg.target_update_frequency) == 0:
+            if (i % cfg.target_update_frequency) == 0:
                 update_exponential_moving_average(target_q_function, q_function, cfg.alpha)
             
             with torch.amp.autocast(device_type=device_type, enabled=cfg.use_amp):
                 exp_adv = torch.exp(cfg.skill_temperature * adv.detach()).clamp(max=EXP_ADV_MAX)
-                a_mu, a_logstd = policy(state, z_expand)
+                a_mu, a_logstd = policy(phi_s, z)
                 dist = Normal(a_mu, a_logstd.exp())
                 log_prob = dist.log_prob(action).sum(dim=-1)
                 policy_loss = -(exp_adv * log_prob).mean()
@@ -373,13 +377,13 @@ def train(
 
 
 @click.command()
-@click.option("-c", "--config", type=str, default='train_hilbert_policy', required=True, help="config file name")
+@click.option("-c", "--config", type=str, default='train_rgb_hilbert_policy', required=True, help="config file name")
 def main(config):
     CONFIG_FILE = os.path.join(os.getcwd(), f'config/{config}.yaml')
     cfg = OmegaConf.load(CONFIG_FILE)
     
     if cfg.resume:
-        resume_conf = OmegaConf.load(os.path.join(os.getcwd(), f"data/outputs/hilbert_policy/{cfg.resume_ckpt_dir}/{config}.yaml"))
+        resume_conf = OmegaConf.load(os.path.join(os.getcwd(), f"data/outputs/rgb_hilbert_policy/{cfg.resume_ckpt_dir}/{config}.yaml"))
         cfg.data = resume_conf.data
         cfg.model = resume_conf.model
         cfg.train = resume_conf.train
@@ -396,8 +400,8 @@ def main(config):
     torch.set_float32_matmul_precision('high')
     
     # pretrained hilbert representation model
-    HILP_DICT_PATH = os.path.join(os.getcwd(), f"data/outputs/hilp/{train_cfg.hilp_dir}/{train_cfg.hilp_dict_name}.pt")
-    hilbert_representation = HilbertRepresentation(model_cfg)
+    HILP_DICT_PATH = os.path.join(os.getcwd(), f"data/outputs/rgb_hilp/{train_cfg.hilp_dir}/{train_cfg.hilp_dict_name}.pt")
+    hilbert_representation = ViewAwareHilbertRepresentation(model_cfg)
     ckpt = torch.load(HILP_DICT_PATH)
     hilbert_representation.load_state_dict(ckpt['hilbert_representation_state_dict'])
     hilbert_representation.eval()
@@ -406,41 +410,39 @@ def main(config):
     
     scaler = torch.amp.GradScaler(enabled=train_cfg.use_amp)
     
-    dataset = SubTrajDataset(train_cfg.seed, data_cfg)
+    dataset = SubTrajRGBDataset(train_cfg.seed, data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
-    use_cuda = train_cfg.device.startswith("cuda") and torch.cuda.is_available()
-    pin_memory = bool(data_cfg.pin_memory and use_cuda)  # pinning on CPU-only runs raises CUDA errors
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=data_cfg.train_batch_size, 
         shuffle=True, 
         num_workers=data_cfg.num_workers, 
-        pin_memory=pin_memory
+        pin_memory=data_cfg.pin_memory
         )
     val_dataloader = DataLoader(
         val_dataset, 
         batch_size=data_cfg.val_batch_size, 
         shuffle=False, 
         num_workers=data_cfg.num_workers, 
-        pin_memory=pin_memory,
+        pin_memory=data_cfg.pin_memory
         )
     
-    q_func = TwinQforHilbert(model_cfg)
-    policy = ConditionedGaussianPolicy(model_cfg)
-    v_func = ValueFunctionforHilbert(model_cfg)
+    q_func = MLPTwinQforHilbert(model_cfg)
+    policy = MLPConditionedGaussianPolicy(model_cfg)
+    v_func = MLPValueFunctionforHilbert(model_cfg)
     q_func.initialize()
     policy.initialize()
     v_func.initialize()
     
     ckpt = None
     if cfg.resume:
-        ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"data/outputs/hilbert_policy/{cfg.resume_ckpt_dir}/*.pt")))
+        ckpts = sorted(glob.glob(os.path.join(os.getcwd(), f"data/outputs/rgb_hilbert_policy/{cfg.resume_ckpt_dir}/*.pt")))
         ckpt = torch.load(ckpts[-1])
         q_func.load_state_dict(ckpt['q_state_dict'])
         v_func.load_state_dict(ckpt['v_state_dict'])
         policy.load_state_dict(ckpt['policy_state_dict'])
     
-    checkpoint_dir = os.path.join(os.getcwd(), f"data/outputs/hilbert_policy/{dt.datetime.now().strftime('%Y_%m_%d')}/{dt.datetime.now().strftime('%H_%M_%S')}")
+    checkpoint_dir = os.path.join(os.getcwd(), f"data/outputs/rgb_hilbert_policy/{dt.datetime.now().strftime('%Y_%m_%d')}/{dt.datetime.now().strftime('%H_%M_%S')}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     print(f"Created output directory: {checkpoint_dir}.")
     OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))

@@ -7,10 +7,9 @@ import threading
 import glob
 import random
 import copy
-import time
 from collections import OrderedDict
 import torch
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset
 from torch.distributions import Normal
 from sklearn.cluster import KMeans
 import numpy as np
@@ -21,9 +20,9 @@ from utils.seed_utils import seed_all
 
 # =============================================================================
 # TrajectoryDataset: {(s, a, s', r, terminal, timeout)_0^T}
-# s: CHW float [0, 1] at timestep t
+# s: HWC uint8 image at timestep t
 # a: [steer, throttle, brake] at timestep t
-# s': CHW float [0, 1] at timestep t+1
+# s': HWC uint8 image at timestep t+1
 # r: float reward at timestep t
 # =============================================================================
 class TrajectoryDataset(Dataset):
@@ -33,8 +32,13 @@ class TrajectoryDataset(Dataset):
         seed_all(self.seed)
         
         self.index_list = list()
+        self.cache_episode_birdview = bool(getattr(cfg, "cache_episode_birdview", False))
+        self.max_cached_episodes = int(getattr(cfg, "max_cached_episodes", 0))
+        
         self._file_cache = None
         self._cache_lock = threading.Lock()
+        self._episode_cache = None
+        self._episode_buckets = {}
         
         hdf5_paths = list()
         for town in cfg.data_town:
@@ -57,14 +61,79 @@ class TrajectoryDataset(Dataset):
                     terminal = False
                 self.index_list.append((hdf5_path, epi, i, next_key, terminal))
             file.close()
+        self._rebuild_episode_buckets()
+    
+    def _load_frame(self, data, idx):
+        frame = torch.from_numpy(data['birdview'][idx])
+        return frame
+    
+    def _get_episode_tensor(self, file_path, epi_key):
+        if not (self.cache_episode_birdview and self.max_cached_episodes > 0):
+            return None
+        self._ensure_handles()
+        if self._episode_cache is None:
+            self._episode_cache = OrderedDict()
+        cache_key = (file_path, epi_key)
+        with self._cache_lock:
+            cached = self._episode_cache.get(cache_key)
+            if cached is not None:
+                self._episode_cache.move_to_end(cache_key)
+                return cached
+
+        f = self._get_file(file_path)
+        data = f[epi_key]
+        frames = torch.from_numpy(data['birdview'][()])
+        steer = torch.from_numpy(data['measurements']['steer'][()])
+        throttle = torch.from_numpy(data['measurements']['throttle'][()])
+        brake = torch.from_numpy(data['measurements']['brake'][()])
+        rewards = torch.from_numpy(data['reward']['r_sum'][()])
+
+        episode_tuple = (frames, steer, throttle, brake, rewards)
+        with self._cache_lock:
+            self._episode_cache[cache_key] = episode_tuple
+            self._episode_cache.move_to_end(cache_key)
+            while len(self._episode_cache) > self.max_cached_episodes:
+                self._episode_cache.popitem(last=False)
+        return episode_tuple
+    
+    def __getstate__(self):
+        """Remove unpicklable members before pickling (for worker processes)."""
+        state = self.__dict__.copy()
+        state["_file_cache"] = None
+        state["_cache_lock"] = None
+        state["_episode_cache"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Recreate members after unpickling (inside each worker)."""
+        self.__dict__.update(state)
+        self._file_cache = None
+        self._cache_lock = None
+        self._episode_cache = None
+
+    def _ensure_handles(self):
+        """Lazily create per-process cache and lock."""
+        if self._file_cache is None:
+            self._file_cache = {}
+        if self._cache_lock is None:
+            self._cache_lock = threading.Lock()
+        if self.cache_episode_birdview and self._episode_cache is None:
+            self._episode_cache = OrderedDict()
+    
+    
+    def _rebuild_episode_buckets(self):
+        """Group sample indices by (file_path, episode) for sequential sampling."""
+        buckets = {}
+        for idx, (file_path, epi_key, *_rest) in enumerate(self.index_list):
+            buckets.setdefault((file_path, epi_key), []).append(idx)
+        self._episode_buckets = buckets
     
     def __len__(self):
         return len(self.index_list)
 
     def _get_file(self, path):
-        if self._file_cache is None:
-            self._file_cache = {}
-        
+        self._ensure_handles()
+
         with self._cache_lock:
             f = self._file_cache.get(path)
             if f is None:
@@ -75,26 +144,31 @@ class TrajectoryDataset(Dataset):
         return f
     
     def __getitem__(self, index):
-        file_path, epi, current_idx, next_idx, terminal = self.index_list[index]
-        
+        file_path, epi, current_idx, next_idx, terminal_flag = self.index_list[index]
+        cached = self._get_episode_tensor(file_path, epi)
         f = self._get_file(file_path)
         data = f[epi]
-        
-        current_obs = torch.from_numpy(data['birdview'][current_idx].astype('float32')) / 255.0
-        next_obs = torch.from_numpy(data['birdview'][next_idx].astype('float32')) / 255.0
-        current_obs = current_obs.permute(2, 0, 1).contiguous()
-        next_obs = next_obs.permute(2, 0, 1).contiguous()
-        
-        steer = float(data['measurements']['steer'][current_idx])
-        throttle = float(data['measurements']['throttle'][current_idx])
-        brake = float(data['measurements']['brake'][current_idx])
+
+        if cached is not None:
+            episode_frames, episode_steer, episode_throttle, episode_brake, episode_rewards = cached
+            current_obs = episode_frames[current_idx]
+            next_obs = episode_frames[next_idx]
+            steer = float(episode_steer[current_idx])
+            throttle = float(episode_throttle[current_idx])
+            brake = float(episode_brake[current_idx])
+            reward_value = float(episode_rewards[current_idx])
+        else:
+            current_obs = self._load_frame(data, current_idx)
+            next_obs = self._load_frame(data, next_idx)
+            steer = float(data['measurements']['steer'][current_idx])
+            throttle = float(data['measurements']['throttle'][current_idx])
+            brake = float(data['measurements']['brake'][current_idx])
+            reward_value = float(data['reward']['r_sum'][current_idx])
+
         action = torch.tensor([steer, throttle, brake], dtype=torch.float32)
-        
-        reward = float(data['reward']['r_sum'][current_idx])
-        reward = torch.tensor([reward], dtype=torch.float32)
-        
-        terminal = torch.tensor([terminal], dtype=torch.float32)
-        
+        reward = torch.tensor([reward_value], dtype=torch.float32)
+        terminal = torch.as_tensor([terminal_flag], dtype=torch.float32)
+
         return (current_obs, action, next_obs, reward, terminal, False)
     
     def split_train_val(self):
@@ -192,12 +266,17 @@ class GoalDataset(Dataset):
         f = self._get_file(file_path)
         data = f[epi_key]
         frames = torch.from_numpy(data['birdview'][()])
+        steer = torch.from_numpy(data['measurements']['steer'][()])
+        throttle = torch.from_numpy(data['measurements']['throttle'][()])
+        brake = torch.from_numpy(data['measurements']['brake'][()])
+        rewards = torch.from_numpy(data['reward']['r_sum'][()])
+        episode_tuple = (frames, steer, throttle, brake, rewards)
         with self._cache_lock:
-            self._episode_cache[cache_key] = frames
+            self._episode_cache[cache_key] = episode_tuple
             self._episode_cache.move_to_end(cache_key)
             while len(self._episode_cache) > self.max_cached_episodes:
                 self._episode_cache.popitem(last=False)
-        return frames
+        return episode_tuple
 
     def _rebuild_episode_buckets(self):
         """Group sample indices by (file_path, episode) for sequential sampling."""
@@ -246,7 +325,6 @@ class GoalDataset(Dataset):
         return f
     
     def __getitem__(self, index):
-
         file_path, epi_key, current_key, next_key, goal_key, is_goal_now = self.index_list[index]
         episode_tensor = self._maybe_get_episode_tensor(file_path, epi_key)
 
@@ -280,52 +358,14 @@ class GoalDataset(Dataset):
         val_dataset._rebuild_episode_buckets()
         
         return train_dataset, val_dataset
-    
-
-class EpisodeChunkSampler(Sampler):
-    """Sampler that keeps samples from the same episode contiguous to improve IO locality."""
-
-    def __init__(self, dataset, chunk_size=32, shuffle=True, seed=0):
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be > 0")
-        self.dataset = dataset
-        self.chunk_size = int(chunk_size)
-        self.shuffle = shuffle
-        self.seed = int(seed)
-        self.epoch = 0
-
-    def set_epoch(self, epoch):
-        self.epoch = int(epoch)
-
-    def __iter__(self):
-        if not getattr(self.dataset, "_episode_buckets", None):
-            self.dataset._rebuild_episode_buckets()
-        chunks = []
-        for indices in self.dataset._episode_buckets.values():
-            start = 0
-            while start < len(indices):
-                chunks.append(indices[start:start + self.chunk_size])
-                start += self.chunk_size
-        if self.shuffle:
-            g = torch.Generator()
-            g.manual_seed(self.seed + self.epoch)
-            perm = torch.randperm(len(chunks), generator=g).tolist()
-            chunks = [chunks[i] for i in perm]
-        for chunk in chunks:
-            for idx in chunk:
-                yield idx
-
-    def __len__(self):
-        return len(self.dataset)
-    
 
 
 # =============================================================================
 # LatentGoalDataset: {(s, z, s', g, R, terminal)} (for OPAL, HsO-VP high-level)
-# s: CHW float [0, 1] at time t
+# s: HWC uint8 image at time t
 # z: skill latent summarizing the sub-trajectory
-# s': CHW float [0, 1] at time t+L (L is fixed)
-# g: CHW float [0, 1] goal image
+# s': HWC uint8 image at time t+L (L is fixed)
+# g: HWC uint8 image goal image
 # R: discounted reward over the sub-trajectory
 # =============================================================================
 class LatentGoalDataset(Dataset):
@@ -338,11 +378,15 @@ class LatentGoalDataset(Dataset):
         self.encoder = encoder
         self.algo = cfg.algo
         
+        self.cache_episode_birdview = bool(getattr(cfg, "cache_episode_birdview", False))
+        self.max_cached_episodes = int(getattr(cfg, "max_cached_episodes", 0))
         self._file_cache = None
         self._cache_lock = threading.Lock()
+        self._episode_cache = None
+        self._episode_buckets = {}
         
         self.index_list = list()
-        hdf5_paths = []
+        hdf5_paths = list()
         for town in cfg.data_town:
             for t in cfg.type:
                 hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town}/{t.lower()}/*.hdf5'))
@@ -357,10 +401,49 @@ class LatentGoalDataset(Dataset):
             goal_idx = epi_length - 1
             for i in range(epi_length - cfg.trajectory_length + 1):
                 next_idx = i + cfg.trajectory_length - 1
-                terminal = (next_idx == epi_length - 1)
+                terminal = (next_idx == (epi_length - 1))
                 self.index_list.append((hdf5_path, epi, i, next_idx, goal_idx, terminal))
             file.close()
-        
+        self._rebuild_episode_buckets()
+    
+    def _load_frame(self, data, idx):
+        """Read a single birdview frame as HWC uint8 tensor."""
+        frame = torch.from_numpy(data['birdview'][idx])
+        return frame
+
+    def _maybe_get_episode_tensor(self, file_path, epi_key):
+        """Optionally cache the entire birdview tensor for the episode."""
+        if not (self.cache_episode_birdview and self.max_cached_episodes > 0):
+            return None
+        self._ensure_handles()
+        if self._episode_cache is None:
+            self._episode_cache = OrderedDict()
+        cache_key = (file_path, epi_key)
+        with self._cache_lock:
+            cached = self._episode_cache.get(cache_key)
+            if cached is not None:
+                self._episode_cache.move_to_end(cache_key)
+                return cached
+        f = self._get_file(file_path)
+        data = f[epi_key]
+        frames = torch.from_numpy(data['birdview'][()])
+        steer = torch.from_numpy(data['measurements']['steer'][()])
+        throttle = torch.from_numpy(data['measurements']['throttle'][()])
+        brake = torch.from_numpy(data['measurements']['brake'][()])
+        with self._cache_lock:
+            self._episode_cache[cache_key] = frames
+            self._episode_cache.move_to_end(cache_key)
+            while len(self._episode_cache) > self.max_cached_episodes:
+                self._episode_cache.popitem(last=False)
+        return frames, steer, throttle, brake
+
+    def _rebuild_episode_buckets(self):
+        """Group sample indices by (file_path, episode) for sequential sampling."""
+        buckets = {}
+        for idx, (file_path, epi_key, *_rest) in enumerate(self.index_list):
+            buckets.setdefault((file_path, epi_key), []).append(idx)
+        self._episode_buckets = buckets
+    
     def __len__(self):
         return len(self.index_list)
     
@@ -369,6 +452,7 @@ class LatentGoalDataset(Dataset):
         state = self.__dict__.copy()
         state["_file_cache"] = None
         state["_cache_lock"] = None
+        state["_episode_cache"] = None
         return state
 
     def __setstate__(self, state):
@@ -376,6 +460,7 @@ class LatentGoalDataset(Dataset):
         self.__dict__.update(state)
         self._file_cache = None
         self._cache_lock = None
+        self._episode_cache = None
 
     def _ensure_handles(self):
         """Lazily create per-process cache and lock."""
@@ -383,6 +468,8 @@ class LatentGoalDataset(Dataset):
             self._file_cache = {}
         if self._cache_lock is None:
             self._cache_lock = threading.Lock()
+        if self.cache_episode_birdview and self._episode_cache is None:
+            self._episode_cache = OrderedDict()
     
     def _get_file(self, path):
         self._ensure_handles()
@@ -398,17 +485,50 @@ class LatentGoalDataset(Dataset):
         
     def __getitem__(self, index):
         file_path, epi_key, start_idx, end_idx, goal_idx, terminal = self.index_list[index]
+        cached = self._maybe_get_episode_tensor(file_path, epi_key)
         f = self._get_file(file_path)
-        
-        data = f[epi_key]
-        current_obs = torch.from_numpy(data['birdview'][start_idx].astype('float32')) / 255.0
-        end_obs = torch.from_numpy(data['birdview'][end_idx].astype('float32')) / 255.0
-        goal_obs = torch.from_numpy(data['birdview'][goal_idx].astype('float32')) / 255.0
-        current_obs = current_obs.permute(2, 0, 1).contiguous()
-        end_obs = end_obs.permute(2, 0, 1).contiguous()
-        goal_obs = goal_obs.permute(2, 0, 1).contiguous()
-        
-        if self.algo == "hilp":
+        d = f[epi_key]
+
+        if cached is not None:
+            episode_tensor, episode_steer, episode_throttle, episode_brake, episode_rewards = cached
+            current_obs = episode_tensor[start_idx]
+            end_obs = episode_tensor[end_idx]
+            goal_obs = episode_tensor[goal_idx]
+        else:
+            episode_rewards = None
+            current_obs = self._load_frame(d, start_idx)
+            end_obs = self._load_frame(d, end_idx)
+            goal_obs = self._load_frame(d, goal_idx)
+
+        if self.algo != "hilp":
+            if cached is not None:
+                obs_seq = episode_tensor[start_idx:end_idx+1].unsqueeze(0).contiguous()
+                steer_seq = episode_steer[start_idx:end_idx+1]
+                throttle_seq = episode_throttle[start_idx:end_idx+1]
+                brake_seq = episode_brake[start_idx:end_idx+1]
+                action_seq = torch.stack([steer_seq, throttle_seq, brake_seq], dim=-1).to(torch.float32)
+                action_seq = action_seq.unsqueeze(0).contiguous()
+            else:
+                obss = []
+                actions = []
+                for j in range(start_idx, end_idx+1):
+                    obs = self._load_frame(d, j)
+                    obss.append(obs)
+
+                    steer = float(d['measurements']['steer'][j])
+                    throttle = float(d['measurements']['throttle'][j])
+                    brake = float(d['measurements']['brake'][j])
+                    action = torch.tensor([steer, throttle, brake], dtype=torch.float32)
+                    actions.append(action)
+
+                obs_seq = torch.stack(obss, dim=0).unsqueeze(0).contiguous()
+                action_seq = torch.stack(actions, dim=0).unsqueeze(0).contiguous()
+
+            with torch.no_grad():
+                z = self.encoder(obs_seq, action_seq)
+                if z.ndim == 2:
+                    z = z[0]
+        else:
             with torch.no_grad():
                 z = self.encoder(current_obs.unsqueeze(0))
                 z_goal = self.encoder(end_obs.unsqueeze(0))
@@ -416,38 +536,23 @@ class LatentGoalDataset(Dataset):
                 norm = torch.norm(vec)
                 z = vec / (norm + 1e-6)
                 z = z.squeeze(0)
-            R = 0.0
-            for j in range(start_idx, end_idx):
-                r_j = float(data['reward']['r_sum'][j])
-                R += (self.gamma ** (j - start_idx)) * r_j
+        if cached is not None:
+            reward_slice = episode_rewards[start_idx:end_idx+1].to(torch.float32)
         else:
-            s_seq, a_seq, r_seq = [], [], []
-            for j in range(start_idx, end_idx):
-                s = torch.from_numpy(data['birdview'][j].astype('float32')) / 255.0
-                s = s.permute(2, 0, 1).contiguous()
-                s_seq.append(s)
-                
-                steer = float(data['measurements']['steer'][j])
-                throttle = float(data['measurements']['throttle'][j])
-                brake = float(data['measurements']['brake'][j])
-                a_seq.append(torch.tensor([steer, throttle, brake], dtype=torch.float32))
-                
-                r_j = float(data['reward']['r_sum'][j])
-                r_seq.append(r_j)
+            reward_slice = torch.as_tensor(d['reward']['r_sum'][start_idx:end_idx+1], dtype=torch.float32)
+        R = 0.0
+        for t, r_val in enumerate(reward_slice):
+            R += (self.gamma ** t) * float(r_val)
 
-            s_seq = torch.stack(s_seq, dim=0).unsqueeze(0).contiguous()
-            a_seq = torch.stack(a_seq, dim=0).unsqueeze(0).contiguous()
-            
-            with torch.no_grad():
-                z = self.encoder(s_seq, a_seq)
-                if z.ndim == 2:
-                    z = z[0]
-            
-            R = 0.0
-            for t, r in enumerate(r_seq):
-                R += (self.gamma ** t) * r
-
-        return (current_obs, z, end_obs, goal_obs, torch.tensor([R], dtype=torch.float32), torch.tensor([terminal], dtype=torch.float32), torch.tensor([False], dtype=torch.float32))
+        return (
+            current_obs,
+            z,
+            end_obs,
+            goal_obs,
+            torch.tensor([R], dtype=torch.float32),
+            torch.tensor([terminal], dtype=torch.float32),
+            torch.tensor([False], dtype=torch.float32),
+        )
          
     
     def split_train_val(self):
@@ -530,6 +635,7 @@ class LatentDataset(Dataset):
         current_obs = current_obs.permute(2, 0, 1).contiguous()
         goal_obs = goal_obs.permute(2, 0, 1).contiguous()
         
+        R = 0.0
         if self.algo == "hilp":
             with torch.no_grad():
                 z = self.encoder(current_obs.unsqueeze(0))
@@ -561,7 +667,6 @@ class LatentDataset(Dataset):
                 if z.ndim == 2:
                     z = z[0]
             
-            R = 0.0
             for t, r in enumerate(r_seq):
                 R += (self.gamma ** t) * r
 
@@ -583,10 +688,10 @@ class LatentDataset(Dataset):
 
 
 # =============================================================================
-# SubTrajDataset: {(s, a, s', r, terminal)}_0^L (for OPAL, HsO-VP VAE)
-# s: CHW float [0, 1] at time t
+# SubTrajDataset: {(s, a, s', r, terminal)}_0^L
+# s: HWC uint8 image at time t
 # a: [steer, throttle, brake] float at time t
-# s': CHW float [0, 1] at time t+1
+# s': HWC uint8 at time t+1
 # r: float reward at time t
 # terminal: terminal flag at time t
 # =============================================================================
@@ -597,10 +702,14 @@ class SubTrajDataset(Dataset):
         
         self.val_ratio = cfg.val_ratio
         self.length = cfg.length
+        self.cache_episode_birdview = bool(getattr(cfg, "cache_episode_birdview", False))
+        self.max_cached_episodes = int(getattr(cfg, "max_cached_episodes", 0))
         
         self.index_list = list()
         self._file_cache = None
         self._cache_lock = threading.Lock()
+        self._episode_cache = None
+        self._episode_buckets = {}
         
         hdf5_paths = list()
         for town in cfg.data_town:
@@ -620,13 +729,61 @@ class SubTrajDataset(Dataset):
             for i in range(last_start+1):
                 self.index_list.append((hdf5_path, epi, i))
             file.close()
-        
+        self._rebuild_episode_buckets()
+    def _load_frame(self, data, idx):
+        """Read a single birdview frame as HWC uint8 tensor."""
+        frame = torch.from_numpy(data['birdview'][idx])
+        return frame
+
+    def _maybe_get_episode_tensor(self, file_path, epi_key):
+        """Optionally cache the entire birdview tensor for the episode."""
+        if not (self.cache_episode_birdview and self.max_cached_episodes > 0):
+            return None
+        self._ensure_handles()
+        if self._episode_cache is None:
+            self._episode_cache = OrderedDict()
+        cache_key = (file_path, epi_key)
+        with self._cache_lock:
+            cached = self._episode_cache.get(cache_key)
+            if cached is not None:
+                self._episode_cache.move_to_end(cache_key)
+                return cached
+        f = self._get_file(file_path)
+        data = f[epi_key]
+        frames = torch.from_numpy(data['birdview'][()])
+        steer = torch.from_numpy(data['measurements']['steer'][()])
+        throttle = torch.from_numpy(data['measurements']['throttle'][()])
+        brake = torch.from_numpy(data['measurements']['brake'][()])
+        rewards = torch.from_numpy(data['reward']['r_sum'][()])
+        episode_tuple = (frames, steer, throttle, brake, rewards)
+        with self._cache_lock:
+            self._episode_cache[cache_key] = episode_tuple
+            self._episode_cache.move_to_end(cache_key)
+            while len(self._episode_cache) > self.max_cached_episodes:
+                self._episode_cache.popitem(last=False)
+        return episode_tuple
+
+    def _rebuild_episode_buckets(self):
+        """Group sample indices by (file_path, episode) for sequential sampling."""
+        buckets = {}
+        for idx, (file_path, epi_key, *_rest) in enumerate(self.index_list):
+            buckets.setdefault((file_path, epi_key), []).append(idx)
+        self._episode_buckets = buckets
+    
     def __len__(self):
         return len(self.index_list)
     
-    def _get_file(self, path):
+    def _ensure_handles(self):
+        """Lazily create per-process cache and lock."""
         if self._file_cache is None:
             self._file_cache = {}
+        if self._cache_lock is None:
+            self._cache_lock = threading.Lock()
+        if self.cache_episode_birdview and self._episode_cache is None:
+            self._episode_cache = OrderedDict()
+    
+    def _get_file(self, path):
+        self._ensure_handles()
         
         with self._cache_lock:
             f = self._file_cache.get(path)
@@ -638,51 +795,50 @@ class SubTrajDataset(Dataset):
         return f
     
     def __getitem__(self, index):
-        file_path, epi_idx, start_idx = self.index_list[index]
+        file_path, epi_key, start_idx = self.index_list[index]
         L = self.length
-
+        cached = self._maybe_get_episode_tensor(file_path, epi_key)
         f = self._get_file(file_path)
-        data = f[epi_idx]
-        
-        states, actions, next_states = [], [], []
-        rewards, terminals, timeouts = [], [], []
-        
-        frames = data['birdview'][start_idx:start_idx+L+1]
-        frames = torch.from_numpy(frames.astype('float32')) / 255.0
-        frames = frames.permute(0, 3, 1, 2).contiguous()
-        states = frames[:-1]
-        next_states = frames[1:]
-        
-        meas = data['measurements']
-        steer = np.asarray(meas['steer'][start_idx:start_idx+L], dtype=np.float32)
-        throttle = np.asarray(meas['throttle'][start_idx:start_idx+L], dtype=np.float32)
-        brake = np.asarray(meas['brake'][start_idx:start_idx+L], dtype=np.float32)
-        actions = torch.from_numpy(np.stack([steer, throttle, brake], axis=1))
-        
-        rewards = np.asarray(data['reward']['r_sum'][start_idx:start_idx+L], dtype=np.float32)
-        rewards = torch.from_numpy(rewards)
-        
+        data = f[epi_key]
+
+        if cached is not None:
+            episode_tensor, episode_steer, episode_throttle, episode_brake, episode_rewards = cached
+            obs = episode_tensor[start_idx:start_idx+L+1]
+            steer = episode_steer[start_idx:start_idx+L]
+            throttle = episode_throttle[start_idx:start_idx+L]
+            brake = episode_brake[start_idx:start_idx+L]
+            rewards = episode_rewards[start_idx:start_idx+L].to(torch.float32)
+        else:
+            obs = torch.from_numpy(data['birdview'][start_idx:start_idx+L+1])
+            steer = torch.from_numpy(data['measurements']['steer'][start_idx:start_idx+L]).to(torch.float32)
+            throttle = torch.from_numpy(data['measurements']['throttle'][start_idx:start_idx+L]).to(torch.float32)
+            brake = torch.from_numpy(data['measurements']['brake'][start_idx:start_idx+L]).to(torch.float32)
+            rewards = torch.from_numpy(data['reward']['r_sum'][start_idx:start_idx+L].astype('float32'))
+
+        actions = torch.stack([steer, throttle, brake], dim=-1)
+        next_states = obs[1:]
+
         epi_last = int(data.attrs['episode_length']) - 1
         t_idx = np.arange(start_idx, start_idx+L, dtype=np.int64)
         terminals = torch.from_numpy((t_idx == epi_last).astype(np.float32))
         timeouts = torch.zeros(L, dtype=torch.float32)
         
-        return (states, actions, next_states, rewards, terminals, timeouts)
+        return (obs, actions, next_states, rewards, terminals, timeouts)
     
     def __getstate__(self):
-        """Make the dataset picklable for DataLoader workers (spawn)."""
+        """Remove unpicklable members before pickling (for worker processes)."""
         state = self.__dict__.copy()
-        # Drop unpicklable / process-local resources
-        state["_cache_lock"] = None
         state["_file_cache"] = None
+        state["_cache_lock"] = None
+        state["_episode_cache"] = None
         return state
 
     def __setstate__(self, state):
-        """Recreate process-local resources after unpickling in each worker."""
+        """Recreate members after unpickling (inside each worker)."""
         self.__dict__.update(state)
-        import threading
-        self._cache_lock = threading.Lock()
-        self._file_cache = None  # let each worker lazily reopen HDF5 files
+        self._file_cache = None
+        self._cache_lock = None
+        self._episode_cache = None
     
     def split_train_val(self):
         val_mask = get_val_mask(len(self), self.val_ratio, self.seed)
@@ -700,7 +856,7 @@ class SubTrajDataset(Dataset):
 
 # =============================================================================
 # LowLevelDataset: {(s, a, z)} (for OPAL, HsO-VP Decoder)
-# s: CHW float [0, 1] at time (t, t+L)
+# s: HWC uint8 image at time (t, t+L)
 # a: [steer, throttle, brake] float at time (t, t+L)
 # z: latent encoded from freezed encoder
 # =============================================================================
@@ -740,6 +896,9 @@ class FilteredDataset(Dataset):
         self.cfg = cfg
         
         self.length = cfg.length
+        self.num_cluster = cfg.discrete_option if hasattr(cfg, "discrete_option") else 6
+        self.keep_ratio = getattr(cfg, "keep_ratio", 0.5)
+        self.tau_k = getattr(cfg, "tau_k", 0.0)
         
         self._file_cache = None
         self._cache_lock = threading.Lock()
@@ -755,30 +914,28 @@ class FilteredDataset(Dataset):
         action_feature_list = list()
         
         for hdf5_path in hdf5_paths:
-            file = h5py.File(hdf5_path, 'r')
-            epi = list(file.keys())[0]
-            data = f[epi]
-            epi_length = data.attrs['episode_length']
-            last_sequence_start = epi_length - (self.length + 1)
-            for i in range(last_sequence_start + 1):
-                end_idx = i + self.length
-                terminal = (end_idx == (epi_length - 1))
-                self.index_list.append((hdf5_path, epi, i, end_idx, terminal))
-                
-                actions = list()
-                for j in range(i, end_idx):
-                    steer = data['measurements']['steer'][j]
-                    throttle = data['measurements']['throttle'][j]
-                    brake = data['measurements']['brake'][j]
-                    action = np.array([steer, throttle, brake], dtype=np.float32)
-                    actions.append(action)
-                concat_action = np.concatenate(actions, axis=0)
-                action_feature_list.append(concat_action)
-            file.close()
+            with h5py.File(hdf5_path, 'r') as h5_file:
+                epi = list(h5_file.keys())[0]
+                data = h5_file[epi]
+                epi_length = data.attrs['episode_length']
+                last_sequence_start = epi_length - (self.length + 1)
+                if last_sequence_start < 0:
+                    continue
+                for i in range(last_sequence_start + 1):
+                    end_idx = i + self.length
+                    terminal = (end_idx == (epi_length - 1))
+                    self.index_list.append((hdf5_path, epi, i, end_idx, terminal))
+
+                    actions = []
+                    for j in range(i, end_idx):
+                        steer = data['measurements']['steer'][j]
+                        throttle = data['measurements']['throttle'][j]
+                        brake = data['measurements']['brake'][j]
+                        action = np.array([steer, throttle, brake], dtype=np.float32)
+                        actions.append(action)
+                    concat_action = np.concatenate(actions, axis=0)
+                    action_feature_list.append(concat_action)
         self.action_features = np.asarray(action_feature_list)
-        
-        self.num_cluster = cfg.discrete_option if hasattr(cfg, "discrete_option") else 6
-        self.keep_ratio = cfg.keep_ratio if hasattr(cfg, "keep_ratio") else 0.5
         
         kmeans = KMeans(n_clusters=self.num_cluster, random_state=self.seed)
         cluster_labels = kmeans.fit_predict(self.action_features)
@@ -786,7 +943,7 @@ class FilteredDataset(Dataset):
         
         clusters = {k: np.where(cluster_labels == k)[0] for k in range(self.num_cluster)}
         
-        target_total = int(len(self.action_features) * cfg.keep_ratio)
+        target_total = int(len(self.action_features) * self.keep_ratio)
         target_per_cluster = max(1, target_total // self.num_cluster)
         print(f"[FilteredDataset] k={self.num_cluster}, keep_ratio={self.keep_ratio}, \ntarget_total={target_total}, per_cluster={target_per_cluster}")
 

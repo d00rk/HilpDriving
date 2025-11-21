@@ -1,36 +1,42 @@
 data:
-    data_town: ["Town01", "Town03", "Town04", "Town06"]
+    data_town: ["Town01", "Town04", "Town06"]
+    type: ["short"]
     num_workers: 4
-    train_batch_size: 256
-    val_batch_size: 256
+    pin_memory: false
+    train_batch_size: 128
+    val_batch_size: 64
     val_ratio: 0.2
     length: 10
 
 model:
-    obs_dim: 192
-    action_dim: 2
     latent_dim: 10
+    action_dim: 3
     latent_as_action: false
-    q_hidden_dim: 32
-    v_hidden_dim: 32
-    obs_feature_dim: 64
-    hidden_dim: 128
+    obs_feature_dim: 128
+    condition_dim: 10
+    hidden_dim: 256
+    output_dim: 3
+    q_hidden_dim: 256
+    v_hidden_dim: 256
 
 train:
-    algo: "iql"
-    hilp_dir: "20250321_202436"
-    hilp_dict_name: "hilbert_representation_20250321_211710_epoch_30"
+    hilp_dir: "2025_11_19/11_30_09"
+    hilp_dict_name: "epoch_0045_loss_0.064"
     device: "cuda:0"
     seed: 42
-    num_epochs: 1000
-    eval_frequency: 10
-    q_lr: 0.001
-    v_lr: 0.001
-    policy_lr: 0.001
-    max_steps: 10000
+    num_epochs: 100
+    eval_frequency: 5          # epochs
+    log_frequency: 100          # steps
+    target_update_frequency: 1
+    use_amp: true
+    save_latest_ckpt: true
+    patience: 5
+    q_lr: 3e-4
+    v_lr: 3e-4
+    policy_lr: 1e-4
     tau: 0.7
-    beta: 0.5
-    discount: 0.99
+    skill_discount: 0.99
+    skill_temperature: 0.5
     alpha: 0.005
     num_random: 10
     temperature: 1.0
@@ -38,10 +44,9 @@ train:
     z_high: 1.0
     z_low: -1.0
 
-resume: true
-resume_ckpt_dir: "20250322_113625"
-verbose: true
+resume: false
+resume_ckpt_dir: null
 wb: true
 wandb_project: "hilp"
-wandb_name: "train_hilbert_policy_iql"
-wandb_tag: ["Town01", "Town03", "Town04", "Town06", "iql", "low-level-policy"]
+wandb_name: "hilbert_policy"
+wandb_tag: ["low-level-policy"]

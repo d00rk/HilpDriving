@@ -1,13 +1,13 @@
 defaults:
   - agent: iql
-  - test_suites: nocrash_dense
+  - test_suites: lb_test_nn
 actors:
   hero:
     agent: iql
     reward:
       entry_point: reward.valeo_action:ValeoAction
     terminal:
-      entry_point: terminal.valeo_no_det_px:ValeoNoDetPx
+      entry_point: terminal.leaderboard:Leaderboard
 carla_sh_path: /home/mkdusgml/carla_ws/carla0910/CarlaUE4.sh
 log_level: INFO
 host: localhost
@@ -20,5 +20,5 @@ wb: true
 wb_project: hsovp
 wb_name: eval_hsovp
 wb_notes: null
-wb_tags: ['hsovp', 'baseline', 'evaluation', 'nocrash_dense', ]
+wb_tags: ['hsovp']
 log_video: true

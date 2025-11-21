@@ -61,19 +61,41 @@ def normalize_control(control):
     return float(np.clip(control, -1.0, 1.0))
 
 def initialize_weights(m):
-    if isinstance(m, (nn.Linear, nn.Conv2d)):
+    """
+    Initialize weights for various layers including CNN, RNN, and Transformer.
+    """
+    # 1. Linear & Convolutional Layers (Include ConvTranspose2d for BEV Decoder)
+    if isinstance(m, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
         nn.init.xavier_uniform_(m.weight)
         if m.bias is not None:
             nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.GRU) or isinstance(m, nn.GRUCell):
+            
+    # 2. Recurrent Layers (GRU, LSTM)
+    elif isinstance(m, (nn.GRU, nn.GRUCell, nn.LSTM, nn.LSTMCell)):
         for name, param in m.named_parameters():
-            if 'weight_ih' in name:  # Input-to-hidden weights
+            if 'weight_ih' in name:
                 nn.init.orthogonal_(param)
-            elif 'weight_hh' in name:  # Hidden-to-hidden weights
+            elif 'weight_hh' in name:
                 nn.init.orthogonal_(param)
             elif 'bias' in name:
                 nn.init.zeros_(param)
                 
+    # 3. Normalization Layers (LayerNorm used in Transformer, BatchNorm)
+    elif isinstance(m, (nn.LayerNorm, nn.BatchNorm2d, nn.GroupNorm)):
+        if m.weight is not None:
+            nn.init.ones_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+    # 4. Transformer MultiheadAttention
+    # (TransformerEncoderLayer internally uses MultiheadAttention)
+    elif isinstance(m, nn.MultiheadAttention):
+        if m.in_proj_weight is not None:
+            nn.init.xavier_uniform_(m.in_proj_weight)
+        if m.in_proj_bias is not None:
+            nn.init.zeros_(m.in_proj_bias)
+
+
 def get_reward_statics(dataloader):
     rewards = list()
     for _, _, _, r, _, _ in dataloader:
@@ -196,8 +218,13 @@ def ensure_chw(img):
         if img.dim() == 4 and img.shape[-1] in (1, 3, 4):  # HWC -> CHW
             img = img.permute(0, 3, 1, 2).contiguous()
             img = img.to(torch.float32).div_(255.0)
+        elif img.dim() == 5 and img.shape[-1] in (1, 3, 4):  # BHWC -> BCHW
+            img = img.permute(0, 1, 4, 2, 3).contiguous()
+            img = img.to(torch.float32).div_(255.0)
         return img
     
     if img.dim() == 4 and img.shape[1] not in (1, 3, 4) and img.shape[-1] in (1, 3, 4):
         img = img.permute(0, 3, 1, 2).contiguous()
+    elif img.dim() == 5 and img.shape[2] not in (1, 3, 4) and img.shape[-1] in (1, 3, 4):
+        img = img.permute(0, 1, 4, 2, 3).contiguous()
     return img

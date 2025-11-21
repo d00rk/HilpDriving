@@ -6,6 +6,15 @@ import numbers
 import pandas as pd
 
 
+def _stats_dict(prefix, x):
+    x32 = x.detach().float()
+    return {
+        f"{prefix}/min": float(x32.min().item()),
+        f"{prefix}/max": float(x32.max().item()),
+        f"{prefix}/mean": float(x32.mean().item()),
+        f"{prefix}/std": float(x32.std(unbiased=False).item())
+    }
+
 def read_json_log(path: str, 
         required_keys: Sequence[str]=tuple(), 
         **kwargs) -> pd.DataFrame:

@@ -156,3 +156,115 @@ class ValueFunctionforHilbert(ValueFunction):
     
     def initialize(self):
         self.apply(initialize_weights)
+
+
+class MLPTwinQ(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        
+        input_dim = cfg.latent_dim * 3
+        
+        self.q1 = nn.Sequential(
+            nn.Linear(input_dim, cfg.q_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.q_hidden_dim, cfg.q_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.q_hidden_dim, 1)
+        )
+        
+        self.q2 = nn.Sequential(
+            nn.Linear(input_dim, cfg.q_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.q_hidden_dim, cfg.q_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.q_hidden_dim, 1)
+        )
+    
+    def both(self, state, goal, action):
+        x = torch.cat([state, goal, action], dim=-1)
+        q1 = self.q1(x).squeeze(-1)
+        q2 = self.q2(x).squeeze(-1)
+        return q1, q2
+    
+    def forward(self, state, goal, action):
+        return torch.min(*self.both(state, goal, action))
+    
+    def initialize(self):
+        self.apply(initialize_weights)
+
+
+class MLPValueFunction(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        input_dim = cfg.latent_dim * 2
+        
+        self.v = nn.Sequential(
+            nn.Linear(input_dim, cfg.v_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.v_hidden_dim, cfg.v_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.v_hidden_dim, 1)
+        )
+    
+    def forward(self, state, goal):
+        x = torch.cat([state, goal], dim=-1)
+        return self.v(x).squeeze(-1)
+
+    def initialize(self):
+        self.apply(initialize_weights)
+
+
+class MLPTwinQforHilbert(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        
+        input_dim = cfg.latent_dim + cfg.latent_dim + cfg.action_dim
+        
+        self.q1 = nn.Sequential(
+            nn.Linear(input_dim, cfg.q_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.q_hidden_dim, cfg.q_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.q_hidden_dim, 1)
+        )
+        
+        self.q2 = nn.Sequential(
+            nn.Linear(input_dim, cfg.q_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.q_hidden_dim, cfg.q_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.q_hidden_dim, 1)
+        )
+    
+    def both(self, state, skill, action):
+        x = torch.cat([state, skill, action], dim=-1)
+        q1 = self.q1(x).squeeze(-1)
+        q2 = self.q2(x).squeeze(-1)
+        return q1, q2
+    
+    def forward(self, state, skill, action):
+        return torch.min(*self.both(state, skill, action))
+    
+    def initialize(self):
+        self.apply(initialize_weights)
+
+
+class MLPValueFunctionforHilbert(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        input_dim = cfg.latent_dim + cfg.latent_dim
+        
+        self.v = nn.Sequential(
+            nn.Linear(input_dim, cfg.v_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.v_hidden_dim, cfg.v_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.v_hidden_dim, 1)
+        )
+    
+    def forward(self, state, skill):
+        x = torch.cat([state, skill], dim=-1)
+        return self.v(x).squeeze(-1)
+    
+    def initialize(self):
+        self.apply(initialize_weights)
