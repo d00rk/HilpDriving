@@ -68,7 +68,7 @@ def eval(
             ncols=100
             )
 
-    with torch.inference_mode(), torch.cuda.amp.autocast(enabled=cfg.use_amp):
+    with torch.inference_mode(), torch.amp.autocast(device_type='cuda', enabled=cfg.use_amp):
         for i, (state, action, next_state, reward, terminal, _) in pbar:
             state = state.to(cfg.device, non_blocking=True)
             action = action.to(cfg.device, non_blocking=True)
@@ -269,7 +269,7 @@ def train(
             
             B, C, H, W = state.shape
             if cfg.algo == "iql":
-                with torch.cuda.amp.autocast(enabled=cfg.use_amp):
+                with torch.amp.autocast(device_type='cuda', enabled=cfg.use_amp):
                     with torch.no_grad():
                         q_target = target_q_function(state, action)
                         next_v = v_function(next_state)
@@ -280,7 +280,7 @@ def train(
                 scaler.scale(v_loss).backward()
                 scaler.step(v_optimizer)
                 
-                with torch.cuda.amp.autocast(enabled=cfg.use_amp):
+                with torch.amp.autocast(device_type='cuda', enabled=cfg.use_amp):
                     targets = reward + (1.0 - terminal) * cfg.discount * next_v.detach()
                     q1, q2 = q_function.both(state, action)
                     q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
@@ -290,7 +290,7 @@ def train(
                 
                 update_exponential_moving_average(target_q_function, q_function, cfg.alpha)
                 
-                with torch.cuda.amp.autocast(enabled=cfg.use_amp):
+                with torch.amp.autocast(device_type='cuda', enabled=cfg.use_amp):
                     exp_adv = torch.exp(cfg.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
                     a_mu, a_logstd = policy(state)
                     dist = Normal(a_mu, a_logstd.exp())
@@ -311,7 +311,7 @@ def train(
                 total_policy_loss += policy_loss.item()
             
             elif cfg.algo == 'cql':
-                with torch.cuda.amp.autocast(enabled=cfg.use_amp):
+                with torch.amp.autocast(device_type='cuda', enabled=cfg.use_amp):
                     with torch.no_grad():
                         a_next_mu, a_next_logstd = policy(next_state)
                         dist_next = torch.distributions.Normal(a_next_mu, a_next_logstd.exp())
@@ -359,7 +359,7 @@ def train(
                 
                 update_exponential_moving_average(target_q_function, q_function, cfg.alpha)
                 
-                with torch.cuda.amp.autocast(enabled=cfg.use_amp):
+                with torch.amp.autocast(device_type='cuda', enabled=cfg.use_amp):
                     policy_loss = (cfg.alpha_entropy * log_prob - q_new).mean()
                 
                 policy_optimizer.zero_grad(set_to_none=True)
@@ -567,7 +567,7 @@ def main(config):
     else:
         v_func = None
     
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler()
     
     if is_main_process():
         checkpoint_dir = os.path.join(os.getcwd(), f"outputs/offline_rl/{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")

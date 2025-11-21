@@ -22,6 +22,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 from torch.distributions import Normal
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 from model.hilp import ViewAwareHilbertRepresentation
 from model.value_function import MLPTwinQforHilbert, MLPValueFunctionforHilbert
@@ -34,6 +37,21 @@ from utils.logger import JsonLogger, _stats_dict
 
 
 EXP_ADV_MAX = 100.
+
+
+class _NoOpLogger:
+    def start(self):
+        return None
+
+    def stop(self):
+        return None
+
+    def log(self, *args, **kwargs):
+        return None
+
+
+def _is_distributed():
+    return dist.is_available() and dist.is_initialized()
 
 
 def eval(
@@ -50,6 +68,8 @@ def eval(
     q_function.eval()
     policy.eval()
     v_function.eval()
+    if _is_distributed() and dist.get_rank() != 0:
+        return {}
     
     eval_loss = {}
     pbar = tqdm(
@@ -143,7 +163,11 @@ def train(
     ckpt,
     checkpoint_dir,
     cfg,
-    logger
+    logger,
+    is_distributed=False,
+    is_main_process=True,
+    local_rank=0,
+    world_size=1
     ):
     
     model = model.to(cfg.device)
@@ -151,8 +175,13 @@ def train(
     
     q_function = q_function.to(cfg.device)
     policy = policy.to(cfg.device)
-    target_q_function = copy.deepcopy(q_function).requires_grad_(False).to(cfg.device)
     v_function = v_function.to(cfg.device)
+    target_q_function = copy.deepcopy(q_function).requires_grad_(False).to(cfg.device)
+    
+    if is_distributed:
+        q_function = DDP(q_function, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        v_function = DDP(v_function, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        policy = DDP(policy, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
     q_optimizer = torch.optim.AdamW(q_function.parameters(), lr=cfg.q_lr)
     policy_optimizer = torch.optim.AdamW(policy.parameters(), lr=cfg.policy_lr)
@@ -166,8 +195,9 @@ def train(
         v_optimizer.load_state_dict(ckpt['v_optimizer_state_dict'])
         del ckpt
     
-    print(f"[Train] {cfg.device} is used.")
-    print(f"[Train] Start at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
+    if is_main_process:
+        print(f"[Train] {cfg.device} is used.")
+        print(f"[Train] Start at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
 
     best_loss = float(np.inf)
     global_step = 0
@@ -182,8 +212,9 @@ def train(
             enumerate(train_dataloader), 
             total=len(train_dataloader), 
             desc=f"[Train] Epoch {epoch}/{cfg.num_epochs}", 
-            leave=True, 
-            ncols=100
+            leave=is_main_process, 
+            ncols=100,
+            disable=not is_main_process
             )
         
         q_function.train()
@@ -219,7 +250,7 @@ def train(
                 phi_s, _ = model(state_flat)
                 phi_next_s, _ = model(next_state_flat)
             
-            z = sample_latent_vectors(batch_size=B, latent_dim=latent_dim)
+            z = sample_latent_vectors(batch_size=B, latent_dim=latent_dim).to(cfg.device)
             
             dist = phi_next_s - phi_s
             intrinsic_reward = (dist * z).sum(dim=-1)
@@ -269,7 +300,7 @@ def train(
             total_v_loss += v_loss.item()
             total_policy_loss += policy_loss.item()
             
-            if (i % cfg.log_frequency) == 0:
+            if (i % cfg.log_frequency) == 0 and is_main_process:
                 step_log = {
                     'train/epoch': epoch,
                     'train/global_step': global_step,
@@ -298,6 +329,11 @@ def train(
         avg_v_loss = total_v_loss / len(train_dataloader)
         avg_policy_loss = total_policy_loss / len(train_dataloader)
         avg_loss = total_loss / len(train_dataloader)
+        if is_distributed:
+            metric_tensor = torch.tensor([avg_loss, avg_q_loss, avg_v_loss, avg_policy_loss], device=cfg.device)
+            dist.all_reduce(metric_tensor, op=dist.ReduceOp.SUM)
+            metric_tensor /= world_size
+            avg_loss, avg_q_loss, avg_v_loss, avg_policy_loss = metric_tensor.tolist()
         
         log_dict = {"train/epoch": epoch,
                     "train/global_step": global_step,
@@ -307,17 +343,17 @@ def train(
                     "train/policy_loss": avg_policy_loss,
                     "train/lr": policy_lr_scheduler.get_last_lr()[0]}
         
-        logger.log(log_dict)
-        if wb:
+        logger.log(log_dict) if is_main_process else None
+        if wb and is_main_process:
             wandb.log(log_dict, step=global_step)
         
-        if cfg.save_latest_ckpt:
+        if cfg.save_latest_ckpt and is_main_process:
             checkpoint_path = os.path.join(checkpoint_dir, f"latest.pt")
             torch.save({
                 'epoch': epoch,
-                'q_state_dict': q_function.state_dict(),
-                'v_state_dict': v_function.state_dict(),
-                'policy_state_dict': policy.state_dict(),
+                'q_state_dict': q_function.module.state_dict() if is_distributed else q_function.state_dict(),
+                'v_state_dict': v_function.module.state_dict() if is_distributed else v_function.state_dict(),
+                'policy_state_dict': policy.module.state_dict() if is_distributed else policy.state_dict(),
                 'hilbert_representation_state_dict': model.state_dict(),
                 'q_optimizer_state_dict': q_optimizer.state_dict(),
                 'v_optimizer_state_dict': v_optimizer.state_dict(),
@@ -326,24 +362,36 @@ def train(
             }, checkpoint_path)
         
         if epoch % cfg.eval_frequency == 0:
-            eval_loss_dict = eval(model=model,
-                             q_function=q_function,
-                             target_q_function=target_q_function,
-                             v_function=v_function,
-                             policy=policy,
-                             dataloader=val_dataloader, 
-                             latent_dim=latent_dim,
-                             epoch=epoch,
-                             cfg=cfg)
+            eval_loss_dict = None
+            if (not is_distributed) or is_main_process:
+                eval_loss_dict = eval(model=model,
+                                 q_function=q_function.module if is_distributed else q_function,
+                                 target_q_function=target_q_function,
+                                 v_function=v_function.module if is_distributed else v_function,
+                                 policy=policy.module if is_distributed else policy,
+                                 dataloader=val_dataloader, 
+                                 latent_dim=latent_dim,
+                                 epoch=epoch,
+                                 cfg=cfg)
             
-            print(f"[Validation] Loss: {eval_loss_dict['eval/loss']:.4f}")
+            if is_distributed:
+                eval_tensor = torch.tensor(
+                    [eval_loss_dict.get('eval/loss', 0.0) if eval_loss_dict else 0.0],
+                    device=cfg.device,
+                    dtype=torch.float32,
+                )
+                dist.broadcast(eval_tensor, src=0)
+                eval_loss = eval_tensor.item()
+            else:
+                eval_loss = eval_loss_dict['eval/loss']
+
+            if is_main_process and eval_loss_dict:
+                print(f"[Validation] Loss: {eval_loss_dict['eval/loss']:.4f}")
+                logger.log(eval_loss_dict)
+                if wb:
+                    wandb.log(eval_loss_dict, step=global_step)
             
-            logger.log(eval_loss_dict)
-            if wb:
-                wandb.log(eval_loss_dict, step=global_step)
-            
-            eval_loss = eval_loss_dict['eval/loss']
-            if eval_loss <= best_loss:
+            if eval_loss <= best_loss and is_main_process:
                 import gc
                 gc.collect()
                 
@@ -352,9 +400,9 @@ def train(
                 checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch:04d}_loss_{eval_loss:.3f}.pt")
                 torch.save({
                     'epoch': epoch,
-                    'q_state_dict': q_function.state_dict(),
-                    'v_state_dict': v_function.state_dict(),
-                    'policy_state_dict': policy.state_dict(),
+                    'q_state_dict': q_function.module.state_dict() if is_distributed else q_function.state_dict(),
+                    'v_state_dict': v_function.module.state_dict() if is_distributed else v_function.state_dict(),
+                    'policy_state_dict': policy.module.state_dict() if is_distributed else policy.state_dict(),
                     'hilbert_representation_state_dict': model.state_dict(),
                     'q_optimizer_state_dict': q_optimizer.state_dict(),
                     'v_optimizer_state_dict': v_optimizer.state_dict(),
@@ -365,14 +413,31 @@ def train(
                 }, checkpoint_path)
                 best_loss = eval_loss
                 early_stop_counter = 0
-            else:
+            elif is_main_process:
                 early_stop_counter += 1
+
+            if is_distributed:
+                best_loss_tensor = torch.tensor([best_loss], device=cfg.device, dtype=torch.float32)
+                counter_tensor = torch.tensor([early_stop_counter], device=cfg.device, dtype=torch.long)
+                dist.broadcast(best_loss_tensor, src=0)
+                dist.broadcast(counter_tensor, src=0)
+                best_loss = best_loss_tensor.item()
+                early_stop_counter = int(counter_tensor.item())
+                dist.barrier()
         
-        if early_stop_counter > cfg.patience:
-            print(f"Early Stopped at epoch {epoch:02d} (best loss={best_loss:.4f})")
+        stop_training = early_stop_counter > cfg.patience
+        if is_distributed:
+            stop_tensor = torch.tensor([int(stop_training)], device=cfg.device, dtype=torch.long)
+            dist.broadcast(stop_tensor, src=0)
+            stop_training = bool(stop_tensor.item())
+
+        if stop_training:
+            if is_main_process:
+                print(f"Early Stopped at epoch {epoch:02d} (best loss={best_loss:.4f})")
             break
     
-    print(f"[Train] Finished at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
+    if is_main_process:
+        print(f"[Train] Finished at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
 
 
 
@@ -391,8 +456,6 @@ def main(config):
     data_cfg = cfg.data
     model_cfg = cfg.model
     train_cfg = cfg.train
-    
-    seed_all(train_cfg.seed)
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -412,10 +475,28 @@ def main(config):
     
     dataset = SubTrajRGBDataset(train_cfg.seed, data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
+    
+    is_distributed = False
+    rank = 0
+    world_size = 1
+    local_rank = 0
+    if "WORLD_SIZE" in os.environ and int(os.environ.get("WORLD_SIZE", 1)) > 1:
+        dist.init_process_group("nccl")
+        is_distributed = True
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        train_cfg.device = f"cuda:{local_rank}"
+    
+    seed_all(train_cfg.seed + rank)
+
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if is_distributed else None
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=data_cfg.train_batch_size, 
-        shuffle=True, 
+        shuffle=(train_sampler is None), 
+        sampler=train_sampler,
         num_workers=data_cfg.num_workers, 
         pin_memory=data_cfg.pin_memory
         )
@@ -443,13 +524,14 @@ def main(config):
         policy.load_state_dict(ckpt['policy_state_dict'])
     
     checkpoint_dir = os.path.join(os.getcwd(), f"data/outputs/rgb_hilbert_policy/{dt.datetime.now().strftime('%Y_%m_%d')}/{dt.datetime.now().strftime('%H_%M_%S')}")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    print(f"Created output directory: {checkpoint_dir}.")
-    OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
+    if rank == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        print(f"Created output directory: {checkpoint_dir}.")
+        OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
     
-    logger = JsonLogger(path=os.path.join(checkpoint_dir, "log.json"))
-    logger.start()
-    if cfg.wb:
+    logger = JsonLogger(path=os.path.join(checkpoint_dir, "log.json")) if rank == 0 else _NoOpLogger()
+    logger.start() if rank == 0 else None
+    if cfg.wb and rank == 0:
         wandb.init(project=cfg.wandb_project,
                    config=OmegaConf.to_container(cfg, resolve=True))
         wandb.run.tags = cfg.wandb_tag
@@ -469,10 +551,16 @@ def main(config):
             ckpt=ckpt,
             checkpoint_dir=checkpoint_dir,
             cfg=train_cfg,
-            logger=logger
+            logger=logger,
+            is_distributed=is_distributed,
+            is_main_process=(rank == 0),
+            local_rank=local_rank,
+            world_size=world_size
             )
     finally:
-        logger.stop()
+        logger.stop() if rank == 0 else None
+        if is_distributed:
+            dist.destroy_process_group()
     
 
 if __name__=="__main__":
