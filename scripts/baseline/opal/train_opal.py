@@ -1,5 +1,12 @@
 import sys
 import os
+from pathlib import Path
+
+# Ensure project root is on the path so imports like `model.*` work even when
+# running from nested directories.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
@@ -12,6 +19,9 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 
 import torch
+
+torch.backends.cudnn.enabled = False
+
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, DistributedSampler
@@ -26,7 +36,7 @@ from model.opal import *
 from dataset.dataset import SubTrajDataset
 from utils.seed_utils import seed_all
 from utils.logger import JsonLogger
-from utils.utils import gaussian_nll, kl_diag_gaussians_logvar
+from utils.utils import gaussian_nll, kl_diag_gaussians_logvar, ensure_chw
 from utils.ddp import is_dist_avail_and_initialized, get_rank, is_main_process, setup_distributed, cleanup_distributed, unwrap
 from utils.multiprocessing import _worker_init_fn
 
@@ -40,6 +50,7 @@ def eval(
     epoch,
     cfg
     ):
+    torch.cuda.empty_cache()
     
     encoder = unwrap(encoder)
     decoder = unwrap(decoder)
@@ -66,6 +77,7 @@ def eval(
     
     for i, (state, action, _, _, _, _) in pbar:
         state = state.to(cfg.device, non_blocking=True)
+        state = ensure_chw(state)
         action = action.to(cfg.device, non_blocking=True)
         
         B, L = action.shape
@@ -174,8 +186,10 @@ def train(
         
         for i, (state, action, next_state, _, terminal, _) in pbar:
             state = state.to(device, non_blocking=True)                 # (B, L, C, H, W)
+            state = ensure_chw(state)
             action = action.to(device, non_blocking=True)               # (B, L, A)
             next_state = next_state.to(device, non_blocking=True)       # (B, L, C, H, W)
+            next_state = ensure_chw(next_state)
             terminal = terminal.to(device, non_blocking=True)           # (B, L)
             
             with torch.cuda.amp.autocast(enabled=cfg.use_amp):
@@ -221,7 +235,7 @@ def train(
                 logger.log(step_log)
                 if wb:
                     wandb.log(step_log, step=global_step)
-                if isinstance(pbar, tqdm.tqdm):
+                if isinstance(pbar, tqdm):
                     pbar.set_postfix({"Total Loss": f"{loss.item():.4f}"})
             
             global_step += 1

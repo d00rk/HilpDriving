@@ -2,8 +2,8 @@ data:
     data_town: ["Town01", "Town04", "Town06"]
     type: ["short"]
     p: 0.2
-    train_batch_size: 64
-    val_batch_size: 64
+    train_batch_size: 256
+    val_batch_size: 256
     val_ratio: 0.2
     history_length: 3
     num_workers: 2

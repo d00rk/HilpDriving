@@ -1,5 +1,5 @@
 data:
-    data_town: ["Town07"]
+    data_town: ["Town01", "Town04", "Town06"]
     type: ["short"]
     train_batch_size: 256
     val_batch_size: 256
@@ -20,6 +20,7 @@ model:
 
 train:
     device: "cuda:0"
+    use_amp: true
     seed: 42
     num_epochs: 1000
     eval_frequency: 10
@@ -32,4 +33,4 @@ verbose: true
 wb: true
 wandb_project: "opal"
 wandb_name: "opal"
-wandb_tag: ["opal", "baseline", "leaderboard1", "Town01", "Town03", "Town04", "Town06"]
+wandb_tag: ["opal"]

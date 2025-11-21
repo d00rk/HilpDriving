@@ -1,6 +1,14 @@
 import sys
 import os
+from pathlib import Path
+
+# Ensure project root is on the path so imports like `model.*` work even when
+# running from nested directories.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
 import glob
 import wandb
@@ -20,6 +28,7 @@ import torch.multiprocessing as mp
 
 from model.hso_vp import * 
 from dataset.dataset import FilteredDataset
+from utils.utils import ensure_chw
 from utils.seed_utils import seed_all
 from utils.logger import JsonLogger, _stats_dict
 

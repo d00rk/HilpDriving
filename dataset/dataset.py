@@ -714,7 +714,7 @@ class SubTrajDataset(Dataset):
         hdf5_paths = list()
         for town in cfg.data_town:
             for t in cfg.type:
-                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town}/{t.lower()}/*.hdf5'))
+                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/{town}/{t.lower()}/*.hdf5'))
                 hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
 
@@ -816,6 +816,7 @@ class SubTrajDataset(Dataset):
             rewards = torch.from_numpy(data['reward']['r_sum'][start_idx:start_idx+L].astype('float32'))
 
         actions = torch.stack([steer, throttle, brake], dim=-1)
+        states = obs[:-1]
         next_states = obs[1:]
 
         epi_last = int(data.attrs['episode_length']) - 1
@@ -823,7 +824,7 @@ class SubTrajDataset(Dataset):
         terminals = torch.from_numpy((t_idx == epi_last).astype(np.float32))
         timeouts = torch.zeros(L, dtype=torch.float32)
         
-        return (obs, actions, next_states, rewards, terminals, timeouts)
+        return (states, actions, next_states, rewards, terminals, timeouts)
     
     def __getstate__(self):
         """Remove unpicklable members before pickling (for worker processes)."""
