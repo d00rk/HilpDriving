@@ -60,14 +60,14 @@ class LatentConditionedPolicy(nn.Module):
 
 
 class ViewAwareHilbertRepresentation(nn.Module):
-    def __init__(self, config):
+    def __init__(self, cfg):
         super().__init__()
-        self.latent_dim = config.latent_dim
+        self.latent_dim = cfg.latent_dim
         
         self.num_views = 3 
         
         # 1. Shared Image Encoder (Lightweight CNN)
-        self.feature_dim = 256 # Transformer dimension
+        self.feature_dim = cfg.feature_dim # Transformer dimension
         
         self.encoder = nn.Sequential(
             nn.Conv2d(3, 32, 4, stride=2, padding=1),   # [32, 32, 32]

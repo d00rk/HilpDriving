@@ -1,0 +1,39 @@
+data:
+    data_town: ["Town01", "Town04", "Town06"]
+    type: ["short"]
+    p: 0.2
+    train_batch_size: 64
+    val_batch_size: 64
+    val_ratio: 0.2
+    history_length: 3
+    num_workers: 2
+    prefetch_factor: 1
+    pin_memory: true
+
+model:
+    latent_dim: 10
+    feature_dim: 256
+
+train:
+    device: "cuda:0"
+    use_amp: true
+    seed: 42
+    num_epochs: 100
+    eval_frequency: 5      # in epoch
+    log_frequency: 100       # in steps
+    target_update_frequency: 1
+    lr: 3e-5
+    weight_decay: 1e-4
+    tau: 0.05
+    expectile_tau: 0.7
+    epsilon: 1e-6
+    gamma: 0.95
+    lambda_bev: 0.5
+    patience: 5
+
+resume: false
+resume_ckpt_dir: null
+wb: true
+wandb_project: "hilbert"
+wandb_name: "rgb-hilbert-representation"
+wandb_tag: ["hilbert-representation", "rgb"]
