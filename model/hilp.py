@@ -82,6 +82,7 @@ class ViewAwareHilbertRepresentation(nn.Module):
             nn.Conv2d(128, 128, 4, stride=2, padding=1),# [128, 4, 4]
             nn.BatchNorm2d(128), 
             nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4)),  # enforce fixed spatial size before flatten
             nn.Flatten(),
             nn.Linear(128 * 4 * 4, self.feature_dim),
             nn.LayerNorm(self.feature_dim),
