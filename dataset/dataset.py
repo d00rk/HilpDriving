@@ -954,32 +954,43 @@ class FilteredDataset(Dataset):
             center = cluster_centers[k]
             
             dists = np.linalg.norm(feats - center, axis=1)
-            order = np.argsort(dists)[::-1]
             
-            chosen = []
+            if self.tau_k > 0.0:
+                cluster_tau = self.tau_k * float(np.mean(dists))
+            else:
+                cluster_tau = 0.0  # no diversity constraint if tau_k <= 0
+            
+            order = np.argsort(dists)
+            
+            chosen_local  = []
             for ii in order:
                 f = feats[ii]
-                if len(chosen) == 0:
-                    chosen.append(ii)
+                if len(chosen_local ) == 0:
+                    chosen_local .append(ii)
                 else:
-                    ok = True
-                    for jj in chosen:
-                        if np.linalg.norm(f - feats[jj]) <= self.tau_k:
-                            ok = False
-                            break
-                    if ok:
-                        chosen.append(ii)
-                if len(chosen) >= target_per_cluster:
+                    if cluster_tau > 0.0:
+                        # Enforce minimum pairwise distance within the cluster
+                        f = feats[ii]
+                        ok = True
+                        for jj in chosen_local:
+                            if np.linalg.norm(f - feats[jj]) <= cluster_tau:
+                                ok = False
+                                break
+                        if not ok:
+                            continue
+                    chosen_local.append(ii)
+                
+                if len(chosen_local) >= target_per_cluster:
                     break
             
-            if len(chosen) < target_per_cluster:
+            if len(chosen_local) < target_per_cluster:
                 for ii in order:
-                    if ii not in chosen:
-                        chosen.append(ii)
-                    if len(chosen) >= target_per_cluster:
+                    if ii not in chosen_local:
+                        chosen_local.append(ii)
+                    if len(chosen_local) >= target_per_cluster:
                         break
-            chosen = idxs[np.asarray(chosen, dtype=int)]
-            selected_indices.extend(chosen.tolist())
+            chosen_global = idxs[np.asarray(chosen_local, dtype=int)]
+            selected_indices.extend(chosen_global.tolist())
         
         self.filtered_index_list = [self.index_list[i] for i in selected_indices]
         self.filtered_cluster_labels = cluster_labels[selected_indices].tolist()
