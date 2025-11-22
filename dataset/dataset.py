@@ -1004,10 +1004,28 @@ class FilteredDataset(Dataset):
         self.filtered_cluster_labels = cluster_labels[selected_indices].tolist()
 
         print(f"[FilteredDataset] filtered_index_list length: {len(self.filtered_index_list)}")
-    
-    def _get_file(self, path):
+
+    def __getstate__(self):
+        """Drop unpicklable members before worker processes are spawned."""
+        state = self.__dict__.copy()
+        state["_file_cache"] = None
+        state["_cache_lock"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Recreate per-process caches and locks after unpickling."""
+        self.__dict__.update(state)
+        self._file_cache = None
+        self._cache_lock = None
+
+    def _ensure_handles(self):
         if self._file_cache is None:
             self._file_cache = {}
+        if self._cache_lock is None:
+            self._cache_lock = threading.Lock()
+    
+    def _get_file(self, path):
+        self._ensure_handles()
         
         with self._cache_lock:
             f = self._file_cache.get(path)
