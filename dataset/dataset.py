@@ -43,7 +43,7 @@ class TrajectoryDataset(Dataset):
         hdf5_paths = list()
         for town in cfg.data_town:
             for t in cfg.type:
-                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town}/{t.lower()}/*.hdf5'))
+                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/{town}/{t.lower()}/*.hdf5'))
                 hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
   
@@ -210,7 +210,7 @@ class GoalDataset(Dataset):
         hdf5_paths = list()
         for town in cfg.data_town:
             for t in cfg.type:
-                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town}/{t.lower()}/*.hdf5'))
+                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/{town}/{t.lower()}/*.hdf5'))
                 hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
         
@@ -389,7 +389,7 @@ class LatentGoalDataset(Dataset):
         hdf5_paths = list()
         for town in cfg.data_town:
             for t in cfg.type:
-                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town}/{t.lower()}/*.hdf5'))
+                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/{town}/{t.lower()}/*.hdf5'))
                 hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
         
@@ -593,7 +593,7 @@ class LatentDataset(Dataset):
         hdf5_paths = []
         for town in cfg.data_town:
             for t in cfg.type:
-                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/data/{town}/{t.lower()}/*.hdf5'))
+                hp = glob.glob(os.path.join(os.getcwd(), f'data/lmdrive/{town}/{t.lower()}/*.hdf5'))
                 hdf5_paths.extend(hp)
         hdf5_paths = sorted(hdf5_paths)
         
