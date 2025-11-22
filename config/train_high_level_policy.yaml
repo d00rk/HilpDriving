@@ -43,7 +43,7 @@ train:
     z_high: 1.0
     z_low: -1.0
 
-debug: true
+debug: false
 resume: false
 resume_ckpt_dir: ""
 wb: true

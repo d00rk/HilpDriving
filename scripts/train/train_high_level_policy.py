@@ -4,6 +4,8 @@ Training High-Level Policy Goal-conditioned pi(z|s, g) with pretrained hilbert r
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# Prevent h5py from aborting with file-lock errors when used in DataLoader workers
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 import numpy as np
 import wandb
@@ -144,8 +146,8 @@ def train(
     train_max_step = None
     eval_max_step = None
     if debug:
-        train_max_step = 10
-        eval_max_step = 10
+        train_max_step = 5
+        eval_max_step = 5
         cfg.num_epochs = 2
     
     q_function = q_function.to(cfg.device)
@@ -408,6 +410,14 @@ def main(config):
     
     dataset = LatentGoalDataset(train_cfg.seed, train_cfg.discount, hilbert_representation_cpu, data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
+
+    # In debug mode keep data loading single-threaded to avoid h5py worker aborts
+    if debug:
+        data_cfg.num_workers = 0
+        data_cfg.pin_memory = False
+
+    # Only create a multiprocessing context when workers are used
+    mp_ctx = mp.get_context("spawn") if data_cfg.num_workers > 0 else None
     
     train_dataloader = DataLoader(
         train_dataset, 
@@ -415,6 +425,7 @@ def main(config):
         shuffle=True, 
         num_workers=data_cfg.num_workers, 
         pin_memory=data_cfg.pin_memory,
+        multiprocessing_context=mp_ctx,
         )
     val_dataloader = DataLoader(
         val_dataset, 
@@ -422,6 +433,7 @@ def main(config):
         shuffle=False, 
         num_workers=data_cfg.num_workers, 
         pin_memory=data_cfg.pin_memory,
+        multiprocessing_context=mp_ctx,
         )
     
     # Create model
