@@ -1,5 +1,6 @@
 """
 Training Hilbert Representation Model phi(s)
+Example: torchrun --nproc_per_node=2 scripts/train/train_rgb_hilp.py
 """
 import sys
 import os
@@ -17,7 +18,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.backends.cudnn as cudnn
 import torch.multiprocessing as mp
@@ -28,6 +31,7 @@ from dataset.rgb_dataset import GoalRGBDataset
 from utils.seed_utils import seed_all
 from utils.utils import ensure_chw, l2_expectile_loss, update_exponential_moving_average
 from utils.logger import JsonLogger, _stats_dict
+from utils import ddp as ddp_utils
 
 
 def eval(
@@ -47,12 +51,14 @@ def eval(
         total=len(dataloader), 
         desc=f"[Validation] {epoch}/{cfg.num_epochs}", 
         leave=True, 
-        ncols=100
+        ncols=100,
+        disable=not ddp_utils.is_main_process()
         )
     with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=cfg.use_amp):
         total_loss = 0.0
         total_loss_hilp = 0.0
         total_loss_bev = 0.0
+        num_batches = 0
         for i, (state, next_state, goal, bev, is_goal_now) in pbar:
             for k, v in state.items():
                 v = v.to(cfg.device, non_blocking=True)
@@ -95,15 +101,25 @@ def eval(
             total_loss += loss.item()
             total_loss_hilp += loss_hilp.item()
             total_loss_bev += loss_bev.item()
+            num_batches += 1
             
-            if i == 0:
+            if ddp_utils.is_main_process() and i == 0:
                 comparison = torch.cat([bev[0], bev_pred_t[0]], dim=2)
                 save_path = os.path.join(ckpt_dir, "bev", f"epoch_{epoch:03d}.png")
                 save_image(comparison, save_path)
         
-        eval_loss['eval/loss'] = total_loss / len(dataloader)
-        eval_loss['eval/loss_hilp'] = total_loss_hilp / len(dataloader)
-        eval_loss['eval/loss_bev'] = total_loss_bev  / len(dataloader)
+        # Reduce validation losses across processes so all ranks share the same metrics
+        loss_tensor = torch.tensor(
+            [total_loss, total_loss_hilp, total_loss_bev, num_batches],
+            device=cfg.device
+        )
+        if dist.is_initialized():
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        total_loss, total_loss_hilp, total_loss_bev, num_batches = loss_tensor.tolist()
+        num_batches = max(1, int(num_batches))
+        eval_loss['eval/loss'] = total_loss / num_batches
+        eval_loss['eval/loss_hilp'] = total_loss_hilp / num_batches
+        eval_loss['eval/loss_bev'] = total_loss_bev  / num_batches
     return eval_loss
 
 
@@ -120,8 +136,8 @@ def train(
     logger
     ):
     
-    model = model.to(cfg.device)
-    target_model = target_model.to(cfg.device)
+    # Track whether this is the main process for logging/checkpointing
+    main_process = ddp_utils.is_main_process()
     
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     lr_scheduler = CosineAnnealingLR(optimizer, T_max=cfg.num_epochs*len(train_dataloader))
@@ -131,8 +147,9 @@ def train(
         lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
         del ckpt
     
-    print(f"[Train] {cfg.device} is used.")
-    print(f"[Train] Start at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
+    if main_process:
+        print(f"[Train] {cfg.device} is used.")
+        print(f"[Train] Start at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
     
     best_loss = float(np.inf)
     best_train_loss = float(np.inf)
@@ -152,9 +169,10 @@ def train(
             total=len(train_dataloader), 
             desc=f"[Train] Epoch {epoch}/{cfg.num_epochs}", 
             leave=True, 
-            ncols=100
+            ncols=100,
+            disable=not main_process
             )
-        device_type = 'cuda' if 'cuda' in cfg.device else 'cpu'
+        device_type = 'cuda' if 'cuda' in str(cfg.device) else 'cpu'
         
         model.train()
         
@@ -215,9 +233,10 @@ def train(
             total_loss += loss.item()
             total_loss_hilp += loss_hilp.item()
             total_loss_bev += loss_bev.item()
-            pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
+            if main_process:
+                pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
             
-            if (i % cfg.log_frequency) == 0:
+            if main_process and (i % cfg.log_frequency) == 0:
                 step_log = {"train/epoch": epoch,
                             "train/global_step": global_step,
                             "train/loss": loss.item(),
@@ -233,7 +252,8 @@ def train(
                 step_log.update(_stats_dict("debug/goal", goal))
                 step_log.update({"debug/has_nan_input": int(torch.isnan(state).any().item() or torch.isnan(next_state).any().item() or torch.isnan(goal).any().item())})
                 
-                logger.log(step_log)
+                if logger:
+                    logger.log(step_log)
                 if wb:
                     wandb.log(step_log, step=global_step)
             
@@ -243,17 +263,19 @@ def train(
         avg_loss_hilp = total_loss_hilp / len(train_dataloader)
         avg_loss_bev = total_loss_bev / len(train_dataloader)
         
-        step_log = {"train/epoch": epoch,
-                    "train/global_step": global_step,
-                    "train/loss": avg_loss,
-                    "train/loss_hilp": avg_loss_hilp,
-                    "train/loss_bev": avg_loss_bev,
-                    "train/lr": lr_scheduler.get_last_lr()[0]
-                    }
-        
-        logger.log(step_log)
-        if wb:
-            wandb.log(step_log, step=global_step)
+        if main_process:
+            step_log = {"train/epoch": epoch,
+                        "train/global_step": global_step,
+                        "train/loss": avg_loss,
+                        "train/loss_hilp": avg_loss_hilp,
+                        "train/loss_bev": avg_loss_bev,
+                        "train/lr": lr_scheduler.get_last_lr()[0]
+                        }
+            
+            if logger:
+                logger.log(step_log)
+            if wb:
+                wandb.log(step_log, step=global_step)
          
         if epoch % cfg.eval_frequency == 0:
             eval_loss_dict = eval(
@@ -266,37 +288,43 @@ def train(
                 )
             
             eval_loss = eval_loss_dict['eval/loss']
-            print(f"[Validation] Loss: {eval_loss:.4f}")
-            
-            logger.log(eval_loss_dict)
-            if wb:
-                wandb.log(eval_loss_dict, step=global_step)
+            if main_process:
+                print(f"[Validation] Loss: {eval_loss:.4f}")
+                
+                if logger:
+                    logger.log(eval_loss_dict)
+                if wb:
+                    wandb.log(eval_loss_dict, step=global_step)
             
             if eval_loss <= best_loss:
                 import gc
                 gc.collect()
                 
-                print(f"Save best model of epoch {epoch} (loss={eval_loss:.4f})")
-                
-                checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch:04d}_loss_{eval_loss:.3f}.pt")
-                torch.save({
-                    "epoch": epoch,
-                    "hilbert_representation_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "lr_scheduler_state_dict": lr_scheduler.state_dict(),
-                    "loss": avg_loss,
-                    "eval_loss": eval_loss
-                }, checkpoint_path)
+                if main_process:
+                    print(f"Save best model of epoch {epoch} (loss={eval_loss:.4f})")
+                    
+                    checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch:04d}_loss_{eval_loss:.3f}.pt")
+                    model_to_save = model.module if isinstance(model, DDP) else model
+                    torch.save({
+                        "epoch": epoch,
+                        "hilbert_representation_state_dict": model_to_save.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "lr_scheduler_state_dict": lr_scheduler.state_dict(),
+                        "loss": avg_loss,
+                        "eval_loss": eval_loss
+                    }, checkpoint_path)
                 best_loss = eval_loss
                 early_stop_counter = 0
             else:
                 early_stop_counter += 1
         
         if early_stop_counter > cfg.patience:
-            print(f"Early stopped at epoch {epoch} (best loss={best_loss:.4f})")
+            if main_process:
+                print(f"Early stopped at epoch {epoch} (best loss={best_loss:.4f})")
             break
     
-    print(f"[Train] Finished at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
+    if main_process:
+        print(f"[Train] Finished at {dt.datetime.now().strftime('%Y_%m_%d %H:%M:%S')}")
 
 
 
@@ -305,6 +333,12 @@ def train(
 def main(config):
     CONFIG_FILE = os.path.join(os.getcwd(), f"config/{config}.yaml")
     cfg = OmegaConf.load(CONFIG_FILE)
+    
+    # Initialize torch.distributed using torchrun environment variables if available
+    ddp_enabled = ddp_utils.setup_distributed()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
 
     if cfg.resume:
         resum_conf = OmegaConf.load(os.path.join(os.getcwd(), f"data/outputs/rgb_hilp/{cfg.resume_ckpt_dir}/{config}.yaml"))
@@ -317,6 +351,9 @@ def main(config):
     train_cfg = cfg.train
     
     seed_all(train_cfg.seed)
+    # Use LOCAL_RANK to pick the GPU for this process
+    device_str = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+    train_cfg.device = device_str
     
     cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -337,33 +374,53 @@ def main(config):
         ckpt = torch.load(ckpts[-1])
         model.load_state_dict(ckpt["hilbert_representation_state_dict"])
         target_model.load_state_dict(ckpt["hilbert_representation_state_dict"])
-        print(f"Resume from {ckpts[-1]}")
+        if ddp_utils.is_main_process():
+            print(f"Resume from {ckpts[-1]}")
+    
+    # Move models to the local GPU determined by LOCAL_RANK
+    model = model.to(train_cfg.device)
+    target_model = target_model.to(train_cfg.device)
+    
+    # Wrap the model with DistributedDataParallel for multi-GPU training
+    if ddp_enabled:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     
     dataset = GoalRGBDataset(train_cfg.seed, data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
+    # Use DistributedSampler to shard data across processes
+    train_sampler = DistributedSampler(train_dataset) if ddp_enabled else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False) if ddp_enabled else None
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=data_cfg.train_batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=data_cfg.num_workers,
         pin_memory=data_cfg.pin_memory
     )
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=data_cfg.val_batch_size,
-        shuffle=False,
+        shuffle=val_sampler is None,
+        sampler=val_sampler,
         num_workers=data_cfg.num_workers,
         pin_memory=data_cfg.pin_memory
     )
     
     checkpoint_dir = os.path.join(os.getcwd(), f"data/outputs/rgb_hilp/{dt.datetime.now().strftime('%Y_%m_%d')}/{dt.datetime.now().strftime('%H_%M_%S')}")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
-    os.makedirs(os.path.join(checkpoint_dir, "bev"), exist_ok=True)
+    if ddp_utils.is_main_process():
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        OmegaConf.save(cfg, os.path.join(checkpoint_dir, f"{config}.yaml"))
+        os.makedirs(os.path.join(checkpoint_dir, "bev"), exist_ok=True)
+    # Make sure all processes wait for checkpoint directory setup
+    if ddp_enabled:
+        dist.barrier()
     
-    logger = JsonLogger(path=os.path.join(checkpoint_dir, "log.json"))
-    logger.start()
-    if cfg.wb:
+    logger = JsonLogger(path=os.path.join(checkpoint_dir, "log.json")) if ddp_utils.is_main_process() else None
+    if logger:
+        logger.start()
+    wb_enabled = cfg.wb and ddp_utils.is_main_process()
+    if wb_enabled:
         wandb.init(project=cfg.wandb_project,
                    config=OmegaConf.to_container(cfg, resolve=True))
         wandb.run.tags = cfg.wandb_tag
@@ -377,13 +434,16 @@ def main(config):
             val_dataloader=val_dataloader,
             scaler=scaler,
             ckpt=ckpt, 
-            wb=cfg.wb,
+            wb=wb_enabled,
             checkpoint_dir=checkpoint_dir,
             cfg=train_cfg,
             logger=logger,
             )
     finally:
-        logger.stop()
+        if logger:
+            logger.stop()
+        # Clean up process group so torchrun exits cleanly
+        ddp_utils.cleanup_distributed()
 
 
 if __name__=="__main__":

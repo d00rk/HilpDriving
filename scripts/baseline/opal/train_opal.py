@@ -80,7 +80,7 @@ def eval(
         state = ensure_chw(state)
         action = action.to(cfg.device, non_blocking=True)
         
-        B, L = action.shape
+        B, L, A = action.shape
         latent_mu, latent_logstd = encoder(state, action)
         latent_std = torch.exp(0.5 * torch.clamp(latent_logstd, min=-10, max=10))
         latent_std = torch.clamp(latent_std, min=1e-6)
@@ -111,10 +111,19 @@ def eval(
         distributed.all_reduce(t, op=distributed.ReduceOp.SUM)
     
     sum_loss, sum_recon, sum_kl, sum_batches = t.tolist()
+    # Keep the return type consistent with training loop expectations
+    eval_log = {
+        'eval/loss': 0.0,
+        'eval/recon_loss': 0.0,
+        'eval/kl': 0.0
+    }
     if sum_batches == 0:
-        return 0.0, 0.0, 0.0
+        return eval_log
         
-    return sum_loss / sum_batches, sum_recon / sum_batches, sum_kl / sum_batches
+    eval_log['eval/loss'] = sum_loss / sum_batches
+    eval_log['eval/recon_loss'] = sum_recon / sum_batches
+    eval_log['eval/kl'] = sum_kl / sum_batches
+    return eval_log
 
 
 def train(

@@ -19,6 +19,7 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 
 import torch
+torch.backends.cudnn.enabled = False
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import Normal
@@ -55,7 +56,7 @@ def eval(
             leave=True, 
             ncols=100
             )
-    with torch.inference_mode(), torch.cuda.amp.autocast(enabled=cfg.use_amp)
+    with torch.inference_mode(), torch.cuda.amp.autocast(enabled=cfg.use_amp):
         total_loss = 0.0
         total_recon_loss = 0.0
         total_kl_y_loss = 0.0

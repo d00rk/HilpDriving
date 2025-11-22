@@ -1,5 +1,6 @@
 data:
-    data_town: ["Town01", "Town03", "Town04", "Town06"]
+    data_town: ["Town01", "Town04", "Town06"]
+    type: ["short"]
     num_workers: 4
     train_batch_size: 256
     val_batch_size: 256
@@ -18,19 +19,20 @@ model:
     discrete_option: 10
 
 train:
-    device: "cuda:1"
+    device: "cuda:0"
+    use_amp: true
     seed: 42
-    num_epochs: 1000
+    num_epochs: 100
     eval_frequency: 10
     lr: 0.0001
     kl_weight: 1.0
     beta_y: 0.01
     beta_z: 0.01
 
-resume: true
+resume: false
 resume_ckpt_dir: "20250323_010905"
 verbose: true
 wb: true
 wandb_project: "hso-vp"
 wandb_name: "hsovp"
-wandb_tag: ["hsovp", "baseline", "leaderboard1", "Town01", "Town03", "Town04", "Town06"]
+wandb_tag: ["hsovp", "baseline"]
