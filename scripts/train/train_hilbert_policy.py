@@ -72,12 +72,16 @@ def eval(
             next_state = next_state.to(cfg.device, non_blocking=True) 
             terminal = terminal.to(cfg.device, non_blocking=True)
             
-            state = state[:, :-1]  # align state sequence length with actions/next_state
+            # Keep state/action/next_state lengths in sync; trim to the shortest to avoid shape mismatches
+            seq_len = min(state.shape[1], action.shape[1], next_state.shape[1], terminal.shape[1])
+            state = state[:, :seq_len].contiguous()
+            action = action[:, :seq_len].contiguous()
+            next_state = next_state[:, :seq_len].contiguous()
+            terminal = terminal[:, :seq_len].contiguous()
             state = ensure_chw(state)
             next_state = ensure_chw(next_state)
             
-            B, L, C, H, W = state.shape
-            B, S, A = action.shape
+            B, S, C, H, W = state.shape
             
             z = sample_latent_vectors(batch_size=B, latent_dim=latent_dim)
             z_expand = z.unsqueeze(1).expand(B, S, latent_dim).contiguous().view(B*S, latent_dim)
@@ -88,8 +92,8 @@ def eval(
             next_state = next_state.view(B*S, C, H, W)
             terminal = terminal.view(B*S)
             
-            phi_s = F.normalize(model(state), dim=-1)
-            phi_next_s = F.normalize(model(next_state), dim=-1)
+            phi_s = model(state)
+            phi_next_s = model(next_state)
             intrinsic_reward = ((phi_next_s - phi_s) * z_expand).sum(dim=-1)
             
             q_target = target_q_function(state, z_expand, action)
@@ -198,12 +202,16 @@ def train(
             next_state = next_state.to(cfg.device, non_blocking=True) 
             terminal = terminal.to(cfg.device, non_blocking=True)
             
-            state = state[:, :-1]  # align state sequence length with actions/next_state
+            # Keep state/action/next_state lengths in sync; trim to the shortest to avoid shape mismatches
+            seq_len = min(state.shape[1], action.shape[1], next_state.shape[1], terminal.shape[1])
+            state = state[:, :seq_len].contiguous()
+            action = action[:, :seq_len].contiguous()
+            next_state = next_state[:, :seq_len].contiguous()
+            terminal = terminal[:, :seq_len].contiguous()
             state = ensure_chw(state)
             next_state = ensure_chw(next_state)
             
             B, S, C, H, W = state.shape
-            B, S, A = action.shape
             
             z = sample_latent_vectors(batch_size=B, latent_dim=latent_dim)
             z_expand = z.unsqueeze(1).expand(B, S, latent_dim).contiguous().view(B*S, latent_dim)

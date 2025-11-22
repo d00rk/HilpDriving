@@ -1,6 +1,6 @@
 data:
     algo: "hilp"
-    data_town: ["Town01", "Town03", "Town04", "Town06"]
+    data_town: ["Town01", "Town04", "Town06"]
     num_workers: 4
     train_batch_size: 256
     val_batch_size: 256
@@ -9,31 +9,34 @@ data:
 
 model:
     obs_dim: 192
-    action_dim: 2
+    action_dim: 3
     latent_dim: 10
     latent_as_action: true
     q_hidden_dim: 512
     v_hidden_dim: 512
-    obs_feature_dim: 64
+    obs_feature_dim: 128
     hidden_dim: 256
+    output_dim: 10
 
 train:
-    algo: "iql"
-    hilp_dir: "20250321_202436"
-    hilp_dict_name: "hilbert_representation_20250321_211710_epoch_30"
+    hilp_dir: "2025_11_19/11_30_09"
+    hilp_dict_name: "epoch_0045_loss_0.064"
     device: "cuda:0"
+    use_amp: true
     seed: 42
-    num_epochs: 1000
-    eval_frequency: 10
+    num_epochs: 50
+    eval_frequency: 5
+    target_update_frequence: 1
+    log_frequency: 100
+    save_latest_ckpt: true
+    patience: 5
     q_lr: 3e-4
     v_lr: 3e-4
-    policy_lr: 3e-4
-    max_steps: 10000
+    policy_lr: 1e-4
     tau: 0.9
     beta: 0.5
     discount: 0.99
     alpha: 0.005
-    num_random: 10
     temperature: 1.0
     cql_alpha: 1.0
     z_high: 1.0
@@ -41,8 +44,7 @@ train:
 
 resume: false
 resume_ckpt_dir: ""
-verbose: true
 wb: true
 wandb_project: "hilp"
-wandb_name: "train_high_level_policy_iql"
-wandb_tag: ["Town01", "Town03", "Town04", "Town06", "iql", "high-level-policy"]
+wandb_name: "high_level"
+wandb_tag: ["high-level-policy"]

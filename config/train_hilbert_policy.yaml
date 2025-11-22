@@ -44,8 +44,8 @@ train:
     z_high: 1.0
     z_low: -1.0
 
-resume: false
-resume_ckpt_dir: null
+resume: true
+resume_ckpt_dir: 2025_11_20/18_15_55
 wb: true
 wandb_project: "hilp"
 wandb_name: "hilbert_policy"
