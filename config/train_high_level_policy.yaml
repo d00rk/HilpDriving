@@ -1,14 +1,15 @@
 data:
     algo: "hilp"
     data_town: ["Town01", "Town04", "Town06"]
+    type: ["short"]
     num_workers: 4
-    train_batch_size: 256
-    val_batch_size: 256
+    pin_memory: false
+    train_batch_size: 512
+    val_batch_size: 512
     val_ratio: 0.2
     trajectory_length: 10
 
 model:
-    obs_dim: 192
     action_dim: 3
     latent_dim: 10
     latent_as_action: true
@@ -26,7 +27,7 @@ train:
     seed: 42
     num_epochs: 50
     eval_frequency: 5
-    target_update_frequence: 1
+    target_update_frequency: 1
     log_frequency: 100
     save_latest_ckpt: true
     patience: 5
@@ -42,6 +43,7 @@ train:
     z_high: 1.0
     z_low: -1.0
 
+debug: false
 resume: false
 resume_ckpt_dir: ""
 wb: true

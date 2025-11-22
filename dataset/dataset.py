@@ -16,6 +16,7 @@ import numpy as np
 
 from utils.sampler import get_val_mask
 from utils.seed_utils import seed_all
+from utils.utils import ensure_chw
 
 
 # =============================================================================
@@ -530,10 +531,15 @@ class LatentGoalDataset(Dataset):
                     z = z[0]
         else:
             with torch.no_grad():
-                z = self.encoder(current_obs.unsqueeze(0))
-                z_goal = self.encoder(end_obs.unsqueeze(0))
+                # Normalize inputs for the pretrained encoder (expects float NCHW)
+                device = next(self.encoder.parameters()).device
+                current_input = ensure_chw(current_obs.unsqueeze(0)).to(device)
+                end_input = ensure_chw(end_obs.unsqueeze(0)).to(device)
+
+                z = self.encoder(current_input)
+                z_goal = self.encoder(end_input)
                 vec = z_goal - z
-                norm = torch.norm(vec)
+                norm = torch.norm(vec, dim=-1, keepdim=True)
                 z = vec / (norm + 1e-6)
                 z = z.squeeze(0)
         if cached is not None:

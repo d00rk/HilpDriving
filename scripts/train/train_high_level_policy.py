@@ -3,7 +3,7 @@ Training High-Level Policy Goal-conditioned pi(z|s, g) with pretrained hilbert r
 """
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import numpy as np
 import wandb
@@ -42,7 +42,8 @@ def eval(
     policy,
     dataloader,
     epoch,
-    cfg
+    cfg,
+    max_step
     ):
     
     q_function.eval()
@@ -72,8 +73,9 @@ def eval(
             z = z.to(cfg.device, non_blocking=True)
             next_state = next_state.to(cfg.device, non_blocking=True)
             goal = goal.to(cfg.device, non_blocking=True)
-            reward = reward.to(cfg.device, non_blocking=True)
-            terminal = terminal.to(cfg.device, non_blocking=True)
+            # Reward/terminal come in as (B, 1); squeeze to (B,) to avoid broadcasting with 1D value outputs
+            reward = reward.to(cfg.device, non_blocking=True).squeeze(-1)
+            terminal = terminal.to(cfg.device, non_blocking=True).squeeze(-1)
             
             state = ensure_chw(state)
             next_state = ensure_chw(next_state)
@@ -90,7 +92,7 @@ def eval(
             q_loss = sum(F.mse_loss(q, targets) for q in [q1, q2]) / 2
             
             exp_adv = torch.exp(cfg.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
-            z_mu, z_logstd = policy(state)
+            z_mu, z_logstd = policy(state, goal)
             
             dist = Normal(z_mu, z_logstd.exp())
             log_prob = dist.log_prob(z).sum(dim=-1)
@@ -107,6 +109,9 @@ def eval(
             total_q_loss += q_loss.item()
             total_v_loss += v_loss.item()
             total_policy_loss += policy_loss.item()
+            
+            if max_step is not None and (i >= max_step):
+                break
 
         avg_loss = total_loss / len(dataloader)
         avg_q_loss = total_q_loss / len(dataloader)
@@ -133,8 +138,15 @@ def train(
     ckpt,
     checkpoint_dir,
     cfg,
-    logger
+    logger,
+    debug
     ):
+    train_max_step = None
+    eval_max_step = None
+    if debug:
+        train_max_step = 10
+        eval_max_step = 10
+        cfg.num_epochs = 2
     
     q_function = q_function.to(cfg.device)
     policy = policy.to(cfg.device)
@@ -185,8 +197,8 @@ def train(
             z = z.to(cfg.device, non_blocking=True)
             next_state = next_state.to(cfg.device, non_blocking=True)
             goal = goal.to(cfg.device, non_blocking=True)
-            reward = reward.to(cfg.device, non_blocking=True)
-            terminal = terminal.to(cfg.device, non_blocking=True)
+            reward = reward.to(cfg.device, non_blocking=True).squeeze(-1)
+            terminal = terminal.to(cfg.device, non_blocking=True).squeeze(-1)
             
             state = ensure_chw(state)
             next_state = ensure_chw(next_state)
@@ -218,7 +230,7 @@ def train(
             
             with torch.amp.autocast(device_type=device_type, enabled=cfg.use_amp):
                 exp_adv = torch.exp(cfg.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
-                z_mu, z_logstd = policy(state)
+                z_mu, z_logstd = policy(state, goal)
                 dist = Normal(z_mu, z_logstd.exp())
                 log_prob = dist.log_prob(z).sum(dim=-1)
                 policy_loss = -(exp_adv * log_prob).mean()
@@ -266,6 +278,9 @@ def train(
                 
             global_step += 1
             pbar.set_postfix({"Total Loss": f"{loss:.4f}"})
+            
+            if (train_max_step is not None) and (i >= train_max_step):
+                break
 
         avg_q_loss = total_q_loss / len(train_dataloader)
         avg_v_loss = total_v_loss / len(train_dataloader)
@@ -306,7 +321,8 @@ def train(
                 policy=policy,
                 dataloader=val_dataloader, 
                 epoch=epoch,
-                cfg=cfg
+                cfg=cfg,
+                max_step=eval_max_step
                 )
             
             print(f"[Validation] Loss: {eval_loss_dict['eval/loss']:.4f}")
@@ -337,6 +353,7 @@ def train(
                     'eval_loss': eval_loss 
                 }, checkpoint_path)
                 early_stop_counter = 0
+                best_loss = eval_loss
             else:
                 early_stop_counter += 1
         
@@ -352,6 +369,7 @@ def train(
 def main(config):
     CONFIG_FILE = os.path.join(os.getcwd(), f'config/{config}.yaml')
     cfg = OmegaConf.load(CONFIG_FILE)
+    debug = cfg.debug
     
     if cfg.resume:
         resume_conf = OmegaConf.load(os.path.join(os.getcwd(), f'data/outputs/hilp_high_level/{cfg.resume_ckpt_dir}/{config}.yaml'))
@@ -377,6 +395,7 @@ def main(config):
     ckpt = torch.load(HILP_DICT_PATH)
     hilbert_representation.load_state_dict(ckpt['hilbert_representation_state_dict'])
     hilbert_representation.eval()
+    hilbert_representation.to(train_cfg.device)
     for p in hilbert_representation.parameters():
         p.requires_grad_(False)
     
@@ -443,7 +462,8 @@ def main(config):
             ckpt=ckpt,
             checkpoint_dir=checkpoint_dir,
             cfg=train_cfg,
-            logger=logger
+            logger=logger,
+            debug=debug
             )
     finally:
         logger.stop()
