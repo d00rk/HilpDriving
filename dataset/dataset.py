@@ -431,12 +431,13 @@ class LatentGoalDataset(Dataset):
         steer = torch.from_numpy(data['measurements']['steer'][()])
         throttle = torch.from_numpy(data['measurements']['throttle'][()])
         brake = torch.from_numpy(data['measurements']['brake'][()])
+        rewards = torch.from_numpy(data['reward']['r_sum'][()])
         with self._cache_lock:
-            self._episode_cache[cache_key] = frames
+            self._episode_cache[cache_key] = (frames, steer, throttle, brake, rewards)
             self._episode_cache.move_to_end(cache_key)
             while len(self._episode_cache) > self.max_cached_episodes:
                 self._episode_cache.popitem(last=False)
-        return frames, steer, throttle, brake
+        return self._episode_cache[cache_key]
 
     def _rebuild_episode_buckets(self):
         """Group sample indices by (file_path, episode) for sequential sampling."""
@@ -542,6 +543,7 @@ class LatentGoalDataset(Dataset):
                 norm = torch.norm(vec, dim=-1, keepdim=True)
                 z = vec / (norm + 1e-6)
                 z = z.squeeze(0)
+        z = z.cpu()
         if cached is not None:
             reward_slice = episode_rewards[start_idx:end_idx+1].to(torch.float32)
         else:

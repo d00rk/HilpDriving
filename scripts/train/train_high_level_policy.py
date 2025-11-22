@@ -398,10 +398,15 @@ def main(config):
     hilbert_representation.to(train_cfg.device)
     for p in hilbert_representation.parameters():
         p.requires_grad_(False)
+    # Use a CPU copy for data loading so DataLoader workers never touch CUDA.
+    hilbert_representation_cpu = copy.deepcopy(hilbert_representation).cpu()
+    hilbert_representation_cpu.eval()
+    for p in hilbert_representation_cpu.parameters():
+        p.requires_grad_(False)
     
     scaler = torch.amp.GradScaler(enabled=train_cfg.use_amp)
     
-    dataset = LatentGoalDataset(train_cfg.seed, train_cfg.discount, hilbert_representation, data_cfg)
+    dataset = LatentGoalDataset(train_cfg.seed, train_cfg.discount, hilbert_representation_cpu, data_cfg)
     train_dataset, val_dataset = dataset.split_train_val()
     
     train_dataloader = DataLoader(
