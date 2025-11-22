@@ -19,9 +19,7 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 
 import torch
-
 torch.backends.cudnn.enabled = False
-
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, DistributedSampler
@@ -232,7 +230,7 @@ def train(
             total_recon_loss += recon_nll.item()
             total_kl_loss += kl.item()
             
-            if is_main_process():
+            if is_main_process() and (i % cfg.log_frequency == 0):
                 step_log = {
                     'train/epoch': epoch,
                     'train/global_step': global_step,
@@ -267,7 +265,7 @@ def train(
                 'train/kl': avg_kl_loss
             }
             
-            logger.log(step_log)
+            logger.log(step_log, step=global_step)
             if wb:
                 wandb.log(step_log, step=global_step)
         
